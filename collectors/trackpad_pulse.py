@@ -19,6 +19,7 @@ Files
 """
 import argparse
 import array
+import configparser
 import hashlib
 import random
 import sys
@@ -1535,6 +1536,110 @@ CATALOGUE = [
     {'id': 'pad-off', 'group': 'Trackpad Pulse', 'label': 'Trackpad off', 'hint': 'Switch the pad off; turn it back on from the bar icon.', 'spec': _exec('omarchy-shell nixfred.trackpad-pulse enable false')},
 ]
 CATALOGUE_BY_ID = {a['id']: a for a in CATALOGUE}
+# Fullscreen launches. Omarchy's launchers go through setsid and uwsm-app, so a
+# window is never a child of the gesture's shell and Hyprland's [fullscreen]
+# exec prefix cannot attach. The recorder launches, watches the client list
+# for the window that appears, focuses it by address and fullscreens it.
+FULLSCREEN_WAIT = 8.0
+APP_ID_RE = re.compile(r'^[A-Za-z0-9._@+-]{1,120}$')
+
+
+def desktop_dirs():
+    home = os.environ.get('XDG_DATA_HOME') or str(Path.home() / '.local/share')
+    dirs = [home + '/applications']
+    for d in (os.environ.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share').split(':'):
+        if d:
+            dirs.append(d.rstrip('/') + '/applications')
+    return dirs
+
+
+def desktop_apps():
+    """Launchable desktop entries, first one wins per id, sorted by name."""
+    seen, apps = set(), []
+    for d in desktop_dirs():
+        for f in sorted(glob.glob(d + '/*.desktop')):
+            base = os.path.basename(f)[:-8]
+            if base in seen or not APP_ID_RE.match(base):
+                continue
+            cp = configparser.RawConfigParser(strict=False, interpolation=None)
+            try:
+                cp.read(f, encoding='utf-8')
+            except (configparser.Error, OSError, UnicodeDecodeError):
+                continue
+            if 'Desktop Entry' not in cp:
+                continue
+            e = cp['Desktop Entry']
+            if e.get('Type', '') != 'Application' or e.get('NoDisplay', 'false').lower() == 'true' or e.get('Hidden', 'false').lower() == 'true' or not e.get('Exec'):
+                continue
+            seen.add(base)
+            apps.append({'id': base, 'name': (e.get('Name') or base)[:60], 'file': f})
+    apps.sort(key=lambda a: a['name'].lower())
+    return apps
+
+
+def dynamic_actions():
+    launcher = shlex.join([sys.executable, COLLECTOR, 'open-fullscreen'])
+    out = [{'id': 'term-full', 'group': 'Fullscreen apps', 'label': 'Terminal (default)', 'hint': 'Open the default terminal and fullscreen it.',
+            'spec': _exec(launcher + ' terminal')}]
+    for a in desktop_apps():
+        out.append({'id': 'app:' + a['id'], 'group': 'Fullscreen apps', 'label': a['name'], 'hint': 'Open ' + a['name'] + ' and fullscreen its window.',
+                    'spec': _exec(launcher + ' ' + shlex.quote('app:' + a['id']))})
+    return out
+
+
+def all_actions():
+    by_id = dict(CATALOGUE_BY_ID)
+    for a in dynamic_actions():
+        by_id.setdefault(a['id'], a)
+    return by_id
+
+
+def new_window(before, after):
+    """The first mapped, non-special window in `after` that was not in `before`. Pure."""
+    known = {w.get('address') for w in before}
+    for w in after:
+        if w.get('address') in known or not w.get('mapped', True):
+            continue
+        ws = w.get('workspace') or {}
+        if isinstance(ws, dict) and int(ws.get('id', 0) or 0) < 0:
+            continue
+        return w
+    return None
+
+
+def clients():
+    try:
+        out = subprocess.run(['hyprctl', 'clients', '-j'], capture_output=True, text=True, timeout=3, check=False).stdout
+        value = json.loads(out or '[]')
+        return value if isinstance(value, list) else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def open_fullscreen(target):
+    if target == 'terminal':
+        argv = ['omarchy-launch-terminal']
+        label = 'the terminal'
+    elif target.startswith('app:') and APP_ID_RE.match(target[4:]) and any(a['id'] == target[4:] for a in desktop_apps()):
+        argv = ['gtk-launch', target[4:]]
+        label = target[4:]
+    else:
+        raise RuntimeError('Unknown app.')
+    before = clients()
+    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + FULLSCREEN_WAIT
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        w = new_window(before, clients())
+        if w:
+            addr = str(w.get('address'))
+            if not re.fullmatch(r'0x[0-9a-fA-F]+', addr):
+                break
+            subprocess.run(['hyprctl', 'dispatch', 'hl.dsp.focus({ window = "address:%s" })' % addr], capture_output=True, timeout=3, check=False)
+            time.sleep(0.05)
+            subprocess.run(['hyprctl', 'dispatch', 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'], capture_output=True, timeout=3, check=False)
+            return {'message': 'Opened ' + label + ' fullscreen.', 'address': addr}
+    return {'message': 'Launched ' + label + ', but no new window appeared within %.0f s to fullscreen.' % FULLSCREEN_WAIT}
 DEFAULT_GESTURES = {'3-left': 'ws-slide', '3-right': 'ws-slide', '3-up': 'win-fullscreen', '3-down': 'ws-scratch',
                     '3-pinchin': 'none', '3-pinchout': 'none',
                     '4-left': 'theme-prev', '4-right': 'theme-next', '4-up': 'bg-next', '4-down': 'menu',
@@ -1544,7 +1649,7 @@ DEFAULT_GESTURES = {'3-left': 'ws-slide', '3-right': 'ws-slide', '3-up': 'win-fu
 def gesture_catalogue():
     """The catalogue, minus actions whose command is not installed here."""
     out = []
-    for a in CATALOGUE:
+    for a in CATALOGUE + dynamic_actions():
         entry = {k: a[k] for k in ('id', 'group', 'label', 'hint')}
         entry['pair'] = bool(a.get('pair'))
         entry['available'] = not a.get('requires') or bool(shutil.which(a['requires']))
@@ -1567,16 +1672,17 @@ def normalize_gestures(assignments):
     if not isinstance(assignments, dict):
         raise RuntimeError('Gestures must be an object of slot → action.')
     out = {slot: 'none' for slot in SLOTS}
+    known = all_actions()
     for slot, action in assignments.items():
         if slot not in out:
             raise RuntimeError('Unknown gesture slot: ' + str(slot)[:40])
-        if action not in CATALOGUE_BY_ID:
+        if action not in known:
             raise RuntimeError('Unknown action: ' + str(action)[:40])
         out[slot] = action
     # A pair action owns its whole axis: both directions say the same thing.
     for slot, action in list(out.items()):
         fingers, direction = slot.split('-')
-        if direction in PARTNER and CATALOGUE_BY_ID[action].get('pair'):
+        if direction in PARTNER and known[action].get('pair'):
             out['%s-%s' % (fingers, PARTNER[direction])] = action
     return out
 
@@ -1585,8 +1691,9 @@ def gestures_lua(assignments):
     """The Hyprland Lua for a validated map. Pair actions are emitted once per axis."""
     lines = ['do -- Managed by nixfred.trackpad-pulse. Change gestures in Trackpad Pulse.']
     emitted = set()
+    known = all_actions()
     for slot in SLOTS:
-        action = CATALOGUE_BY_ID[assignments.get(slot, 'none')]
+        action = known.get(assignments.get(slot, 'none'), CATALOGUE_BY_ID['none'])
         spec = action['spec']
         if spec['kind'] == 'none':
             continue
@@ -1734,7 +1841,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
                                            'optimize', 'optimize-applied', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
-                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off'])
+                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'open-fullscreen'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
     args = parser.parse_args()
@@ -1760,6 +1867,8 @@ def main():
             value = json.loads((STATE / 'hint.json').read_text())
         elif args.action == 'gestures-catalogue':
             value = gesture_catalogue()
+        elif args.action == 'open-fullscreen':
+            value = open_fullscreen(str(args.payload or ''))
         elif args.action == 'report':
             today = Recorder._fresh_today(None, time.time())
             try:

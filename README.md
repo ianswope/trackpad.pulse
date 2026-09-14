@@ -99,6 +99,7 @@ Every three- and four-finger swipe and pinch Hyprland offers, each with a search
 | **Themes & backgrounds** | next, previous, random and picked theme; next and picked background; night light |
 | **Omarchy** | menu, emoji, clipboard, keybindings, screenshot region or screen, recording, lock, screensaver, bar, do not disturb, terminal, browser, files |
 | **Media & audio** | volume up, down, mute, mic mute, switch output, brightness, play/pause and tracks where `playerctl` is installed |
+| **Fullscreen apps** | the default terminal, or any installed app, opened as a fullscreen window |
 | **Zoom** | cursor zoom ×2, or live with the pinch |
 | **Trackpad Pulse** | open the dashboard, Optimize for my hand, trackpad off |
 

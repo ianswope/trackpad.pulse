@@ -806,6 +806,7 @@ Panel {
         fingers: root.liveFingers
         tint: root.tint
         surface: Color.background
+        mutedTint: Color.muted
         glint: root.bar ? root.bar.foreground : root.ink
         padEnabled: root.touchpadEnabled && root.deviceConnected
         animate: !root.stale && root.animated
@@ -1051,8 +1052,11 @@ Panel {
         Row {
           width: parent.width
           spacing: 10
+          // The live pad rides in the header on every page. Overview has the
+          // hero-sized one and About has its own, so those two skip it.
+          readonly property bool headerChip: !root.chooseMode && root.active !== "overview" && root.active !== "about"
           Column {
-            width: parent.width - 300
+            width: parent.width - 300 - (parent.headerChip ? 110 : 0)
             spacing: 3
             Heading { text: "TRACKPAD PULSE"; font.pixelSize: 19; font.letterSpacing: 3 }
             Label {
@@ -1062,8 +1066,18 @@ Panel {
               font.pixelSize: 11
             }
           }
+          TrackpadChip {
+            visible: parent.headerChip
+            width: visible ? 100 : 0; height: 50
+            anchors.verticalCenter: parent.verticalCenter
+            fingers: root.liveFingers; tint: root.tint; surface: Color.background; mutedTint: Color.muted; glint: root.ink
+            padEnabled: root.touchpadEnabled && root.deviceConnected
+            animate: root.opened && visible && !root.stale && root.animated
+            level: root.level; aspect: root.padAspect
+          }
           Rectangle {
             width: 290; height: 32; radius: 16
+            anchors.verticalCenter: parent.verticalCenter
             color: Qt.alpha(root.tint, 0.14)
             border.color: Qt.alpha(root.tint, 0.5)
             Row {
@@ -1176,7 +1190,7 @@ Panel {
             gradient: Gradient { GradientStop { position: 0; color: Qt.alpha(root.tint, 0.13) } GradientStop { position: 1; color: root.card } }
             TrackpadChip {
               x: 14; y: 8; width: 236; height: 160
-              fingers: root.liveFingers; tint: root.tint; surface: Color.background; glint: root.ink
+              fingers: root.liveFingers; tint: root.tint; surface: Color.background; mutedTint: Color.muted; glint: root.ink
               padEnabled: root.touchpadEnabled && root.deviceConnected
               animate: root.opened && root.active === "overview" && !root.stale && root.animated
               level: root.level; aspect: root.padAspect
@@ -1316,7 +1330,7 @@ Panel {
               Rectangle {
                 id: gestureCard
                 required property var modelData
-                width: (shell.width - 50) / 6; height: 62; radius: 12; color: root.card; border.color: gestureCard.modelData.k === "palms" && Pulse.num(root.todayCounts.palms) > 0 ? Qt.alpha(root.heat, 0.5) : root.cardEdge
+                width: (shell.width - 50) / 6; height: 62; radius: 12; color: root.card; border.color: root.cardEdge
                 Column {
                   anchors.fill: parent; anchors.margins: 10; spacing: 3
                   Label { text: gestureCard.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }

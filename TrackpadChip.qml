@@ -12,6 +12,7 @@ Item {
     property color palmTint: '#ff6b6b'
     property color surface: '#0b141b'
     property color glint: '#ffffff'
+    property color mutedTint: '#8c9499'
     property bool padEnabled: true
     property bool animate: true
     property bool compact: false
@@ -106,7 +107,7 @@ Item {
             var bw = w - pad * 2, bh = bw / root.aspect
             if (bh > h - pad * 2) { bh = h - pad * 2; bw = bh * root.aspect }
             var x = (w - bw) / 2, y = (h - bh) / 2, r = root.compact ? 3 : 10
-            var tint = root.padEnabled ? root.tint : Qt.rgba(0.55, 0.58, 0.62, 1)
+            var tint = root.padEnabled ? root.tint : root.mutedTint
             // Aura.
             if (!root.compact) {
                 var aura = c.createRadialGradient(w / 2, h / 2, bw * 0.15, w / 2, h / 2, bw * 0.75)

@@ -533,7 +533,7 @@ class GestureTests(unittest.TestCase):
             if action['id'] != 'none':
                 self.assertIn('hl.gesture({ fingers = 3', lua, action['id'])
         catalogue = tp.gesture_catalogue()
-        self.assertEqual(len(catalogue['actions']), len(tp.CATALOGUE))
+        self.assertGreaterEqual(len(catalogue['actions']), len(tp.CATALOGUE))
         self.assertEqual(set(catalogue['defaults']), set(tp.SLOTS))
         self.assertTrue(all(a['group'] and a['label'] and a['hint'] for a in catalogue['actions']))
 
@@ -603,6 +603,41 @@ class HandMouseReportTests(unittest.TestCase):
             self.assertEqual(r['week']['mouse'], 720.0)
             self.assertEqual(r['optimize'][0]['changes'], ['Start'])
             self.assertEqual(r['days'][-1]['day'], today['day'])
+
+
+class FullscreenAppTests(unittest.TestCase):
+    def test_desktop_scan_and_dynamic_actions_respect_xdg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            apps = Path(directory) / 'applications'
+            apps.mkdir()
+            (apps / 'good-app.desktop').write_text('[Desktop Entry]\nType=Application\nName=Good App\nExec=good %U\n')
+            (apps / 'hidden.desktop').write_text('[Desktop Entry]\nType=Application\nName=Hidden\nNoDisplay=true\nExec=h\n')
+            (apps / 'link.desktop').write_text('[Desktop Entry]\nType=Link\nName=Link\nURL=x\n')
+            old = dict(os.environ)
+            os.environ['XDG_DATA_HOME'] = directory
+            os.environ['XDG_DATA_DIRS'] = directory
+            try:
+                found = tp.desktop_apps()
+                self.assertEqual([a['id'] for a in found], ['good-app'])
+                ids = [a['id'] for a in tp.dynamic_actions()]
+                self.assertEqual(ids[0], 'term-full')
+                self.assertIn('app:good-app', ids)
+                clean = tp.normalize_gestures({'3-up': 'app:good-app', '4-up': 'term-full'})
+                lua = tp.gestures_lua(clean)
+                self.assertIn("open-fullscreen app:good-app", lua)
+                self.assertIn('open-fullscreen terminal', lua)
+                with self.assertRaises(RuntimeError):
+                    tp.normalize_gestures({'3-up': 'app:not-installed'})
+                with self.assertRaises(RuntimeError):
+                    tp.open_fullscreen('app:../../etc/passwd')
+            finally:
+                os.environ.clear(); os.environ.update(old)
+
+    def test_new_window_picks_the_first_unseen_mapped_window(self):
+        before = [{'address': '0x1', 'mapped': True}, {'address': '0x2', 'mapped': True}]
+        after = before + [{'address': '0x3', 'mapped': False}, {'address': '0x4', 'mapped': True, 'workspace': {'id': -98}}, {'address': '0x5', 'mapped': True, 'workspace': {'id': 2}}]
+        self.assertEqual(tp.new_window(before, after)['address'], '0x5')
+        self.assertIsNone(tp.new_window(before, before))
 
 
 if __name__ == '__main__':

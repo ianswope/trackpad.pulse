@@ -2,6 +2,14 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.4.0 — 2026-09-14
+
+- **Fullscreen apps as gestures.** A new catalogue group with the default terminal and every launchable desktop entry on the machine, each opened as a fullscreen window. Omarchy's launchers detach through `setsid` and `uwsm-app`, so Hyprland's exec-rule prefix cannot follow them; the recorder launches, watches the client list for the window that appears, focuses it by address and fullscreens it. Searchable in every gesture dropdown.
+- The live pad now rides in the header of every page except Overview, which has the hero-sized one, and About, which has its own.
+- Overview no longer paints a red border on the palms card.
+- Theme: the chip's disabled tint comes from the theme's muted colour instead of a fixed grey. Every colour in the panel is a theme role.
+- Recorder: `open-fullscreen` action; `desktop_apps()` honours `XDG_DATA_HOME` and `XDG_DATA_DIRS`.
+
 ## 1.3.0 — 2026-09-14
 
 - **Report page.** This week against last: distance, touches, clicks, active time, a bar per day, the busiest day and hour, palms rejected, and the last Optimize passes with what they changed.
