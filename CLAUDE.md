@@ -64,20 +64,26 @@ what lets the finger-speed histogram sit under the curve.
 2. **No `shadowBlur` on any Canvas.** It rasterises on the GUI thread and froze
    the whole bar. Glow is a few widening, fading strokes. Every chip coalesces
    paints onto one timer at 20 fps or less; the live file is 20 Hz.
-3. **Never auto-apply a setting.** Optimize proposes; the user presses Apply,
+3. **One change a pass, and the next pass judges it.** `propose()` returns a
+   single change (the first fit is the one exception) plus `queued`; the last
+   applied change is judged once by `judge()` against its `watch` spec and the
+   verdict is written into the log by `settle()`, never recomputed. An undo is
+   a proposal like any other, carrying the logged reason. Do not add a second
+   change to a pass, and do not judge silently.
+4. **Never auto-apply a setting.** Optimize proposes; the user presses Apply,
    and Apply goes through Trackpad Plus's journalled `applyPointerFeel`, so
    Restore previous keeps working. Gestures apply on selection because that is
    what the user chose, but suggested defaults are shown first and applied only
    on request.
-4. **Access model.** Omarchy strips users from the `input` group on purpose.
+5. **Access model.** Omarchy strips users from the `input` group on purpose.
    Never ask for it. The recorder probes; the panel offers a udev `uaccess` rule
    scoped to `ID_INPUT_TOUCHPAD` through one polkit prompt, and revokes it plus
    the ACL. Root scripts run under `umask 022`; revoke strips `u:$PKEXEC_UID`.
-5. **Root functions in `Panel.qml` stay at two-space indentation.**
+6. **Root functions in `Panel.qml` stay at two-space indentation.**
    `test-selection.js` executes them out of the file with a regex.
-6. **Every screenshot is looked at before it is committed.** Crop to the panel,
+7. **Every screenshot is looked at before it is committed.** Crop to the panel,
    open the file, read it. A batch of images is N decisions.
-7. **Version in `manifest.json` only**, semver, a `CHANGELOG.md` entry and a
+8. **Version in `manifest.json` only**, semver, a `CHANGELOG.md` entry and a
    `vX.Y.Z` tag on every behaviour change. Docs-only commits need no bump.
 
 ## Tests
@@ -137,3 +143,14 @@ resize, scroll_move, cursor_zoom; anything else is a Lua lambda calling
 writes `~/.local/state/omarchy/toggles/hypr/zz-trackpad-pulse-gestures.lua`
 through Trackpad Plus's `atomic_write`, and runs `hyprctl reload config-only`.
 Add an action to `CATALOGUE` only; never accept free text from the panel.
+
+## The optimizer's contract
+
+Log rows in `optimize-log.json`: `changes` (each with `key`, `from`, `to`,
+`direction`, `watch`), `evidence` (the rates before), `watch` (what the next
+pass reads), then once judged `judgement` (`kept`, `undo`, `undone`,
+`kept by you`, `overridden`), `judgeReason`, `judgedTs`, `after`. An undo row
+has `undo`, `reverts` and `hold` (`key`, `direction`, `moves`); the same
+change is not re-proposed until that many moves since the undo ask for it.
+`JUDGE_MOVES` / `JUDGE_SECONDS` gate the verdict, `HELPED_BY` is what a nudge
+must earn, `WORSE_BY` is what a shape change may not lose.

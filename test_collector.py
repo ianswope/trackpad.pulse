@@ -378,86 +378,193 @@ def synthetic_hist(median_mm=15.0, p90_mm=90.0, seconds=1800.0):
     return hist
 
 
+def shifted(sessions, offset):
+    return [dict(s, ts=s['ts'] + offset) for s in sessions]
+
+
 class OptimizerTests(unittest.TestCase):
     CURRENT = {'profile': 'custom', 'curve': {'precision': 0.1875, 'start': 1.3, 'end': 2.6, 'fast': 0.6225}, 'scrollFactor': 0.33, 'scrollScale': 1.0, 'gainMaximum': 1.0}
+    # Start at p45 (15 mm/s) and End at p90 (90 mm/s) of synthetic_hist(15, 90): the shape already fits.
+    FITTED = dict(CURRENT, curve={'precision': 0.1875, 'start': 0.59, 'end': 3.54, 'fast': 0.6225})
 
-    def test_fit_places_start_and_end_at_the_percentiles(self):
+    def entry(self, key, label, frm, to, direction, evidence, ts=1_000_000.0, **more):
+        return dict({'ts': ts, 'applied': True, 'changes': [{'key': key, 'label': label, 'from': frm, 'to': to, 'direction': direction, 'watch': tp.watch_for(key, direction)}],
+                     'evidence': dict({'moves': 400}, **evidence)}, **more)
+
+    def test_fit_proposes_one_change_and_queues_the_rest(self):
         out = tp.propose(self.CURRENT, synthetic_sessions(), synthetic_hist(15, 90))
-        keys = {c['key']: c for c in out['changes']}
-        self.assertIn('start', keys)
-        self.assertIn('end', keys)
-        self.assertAlmostEqual(out['proposal']['curve']['start'], round(tp.percentile(synthetic_hist(15, 90), 0.45) / 25.4, 2), places=2)
+        self.assertEqual([c['key'] for c in out['changes']], ['end'], 'End is 24 mm/s off, Start 18: the bigger miss goes first')
         self.assertAlmostEqual(out['proposal']['curve']['end'], round(90 / 25.4, 2), places=2)
+        self.assertEqual(out['proposal']['curve']['start'], 1.3, 'Start waits its turn')
+        self.assertEqual([q['key'] for q in out['queued']], ['start'])
         self.assertEqual(out['verdict'], 'fit')
         self.assertEqual(out['confidence'], 'medium')
+        self.assertEqual(out['changes'][0]['watch'], tp.watch_for('end', 'shape'))
         self.assertEqual(out['proposal']['curve']['fast'], self.CURRENT['curve']['fast'], 'no fingerprint, no gain change')
 
     def test_overshoots_after_fast_moves_lower_fast_gain_by_one_nudge(self):
-        out = tp.propose(self.CURRENT, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90))
-        fast = [c for c in out['changes'] if c['key'] == 'fast']
-        self.assertEqual(len(fast), 1)
-        self.assertAlmostEqual(fast[0]['to'], round(0.6225 * tp.NUDGE_DOWN, 4))
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90))
+        self.assertEqual([c['key'] for c in out['changes']], ['fast'])
+        self.assertAlmostEqual(out['changes'][0]['to'], round(0.6225 * tp.NUDGE_DOWN, 4))
+        self.assertEqual(out['changes'][0]['direction'], 'down')
+        self.assertEqual(out['changes'][0]['watch']['target'], 'fastCorrectionRate')
         self.assertEqual(out['verdict'], 'nudge')
 
+    def test_shape_goes_before_gains(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90))
+        self.assertEqual([c['key'] for c in out['changes']], ['end'])
+        self.assertEqual([q['key'] for q in out['queued']], ['start', 'fast'])
+
     def test_restrokes_raise_fast_gain_unless_at_the_ceiling(self):
-        out = tp.propose(self.CURRENT, synthetic_sessions(restrokes=0.3), synthetic_hist(15, 90))
-        fast = [c for c in out['changes'] if c['key'] == 'fast']
-        self.assertEqual(len(fast), 1)
-        self.assertAlmostEqual(fast[0]['to'], round(0.6225 * tp.NUDGE_UP, 4))
-        capped = dict(self.CURRENT, curve=dict(self.CURRENT['curve'], fast=0.95))
+        out = tp.propose(self.FITTED, synthetic_sessions(restrokes=0.3), synthetic_hist(15, 90))
+        self.assertEqual([c['key'] for c in out['changes']], ['fast'])
+        self.assertAlmostEqual(out['changes'][0]['to'], round(0.6225 * tp.NUDGE_UP, 4))
+        self.assertEqual(out['changes'][0]['watch']['opposite']['metric'], 'fastCorrectionRate')
+        capped = dict(self.FITTED, curve=dict(self.FITTED['curve'], fast=0.95))
         out = tp.propose(capped, synthetic_sessions(restrokes=0.3), synthetic_hist(15, 90))
-        self.assertFalse([c for c in out['changes'] if c['key'] == 'fast'])
+        self.assertEqual(out['changes'], [])
         self.assertTrue(any('Device scale' in n for n in out['notes']))
 
     def test_both_signals_cancel_and_say_so(self):
-        out = tp.propose(self.CURRENT, synthetic_sessions(correction_after_fast=0.4, restrokes=0.3), synthetic_hist(15, 90))
-        self.assertFalse([c for c in out['changes'] if c['key'] == 'fast'])
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.4, restrokes=0.3), synthetic_hist(15, 90))
+        self.assertEqual(out['changes'], [])
         self.assertTrue(any('cancel' in n for n in out['notes']))
 
-    def test_slow_corrections_lower_precision_and_scroll_reversals_lower_scroll(self):
-        out = tp.propose(self.CURRENT, synthetic_sessions(slow_corrections=0.5, scrolls=60, reversals=0.5), synthetic_hist(15, 90))
-        keys = {c['key']: c for c in out['changes']}
-        self.assertAlmostEqual(keys['precision']['to'], round(0.1875 * tp.NUDGE_DOWN, 4))
-        self.assertAlmostEqual(keys['scroll']['to'], round(0.33 * tp.NUDGE_DOWN, 2))
+    def test_precision_goes_before_scroll(self):
+        # Start at 30 mm/s so the 20 mm/s synthetic moves count as slow; the shape still fits synthetic_hist(30, 90).
+        fitted = dict(self.FITTED, curve=dict(self.FITTED['curve'], start=1.18))
+        out = tp.propose(fitted, synthetic_sessions(slow_corrections=0.5, scrolls=60, reversals=0.5), synthetic_hist(30, 90))
+        self.assertEqual([c['key'] for c in out['changes']], ['precision'])
+        self.assertAlmostEqual(out['changes'][0]['to'], round(0.1875 * tp.NUDGE_DOWN, 4))
+        self.assertEqual([q['key'] for q in out['queued']], ['scroll'])
+        self.assertAlmostEqual(out['queued'][0]['to'], round(0.33 * tp.NUDGE_DOWN, 2))
+        self.assertEqual(out['proposal']['scrollFactor'], 0.33, 'queued means not in this proposal')
 
     def test_system_profile_gets_a_first_fit_from_the_preset(self):
         current = dict(self.CURRENT, profile='adaptive', curve=None)
         out = tp.propose(current, synthetic_sessions(), synthetic_hist(15, 90))
         self.assertEqual(out['verdict'], 'first fit')
+        self.assertEqual([c['key'] for c in out['changes']], ['profile', 'start', 'end'], 'the one exception: a curve cannot exist with only one of them')
         self.assertEqual(out['proposal']['profile'], 'custom')
         self.assertLessEqual(out['proposal']['curve']['fast'], 1.0)
         self.assertGreater(out['proposal']['curve']['end'], out['proposal']['curve']['start'])
+        self.assertTrue(any('one change a pass' in n for n in out['notes']))
 
     def test_thin_data_fits_the_shape_but_withholds_the_gains(self):
-        out = tp.propose(self.CURRENT, synthetic_sessions(n_moves=40, correction_after_fast=0.9), synthetic_hist(15, 90, seconds=60))
+        out = tp.propose(self.FITTED, synthetic_sessions(n_moves=40, correction_after_fast=0.9), synthetic_hist(15, 90, seconds=60))
         self.assertEqual(out['confidence'], 'low')
-        self.assertFalse([c for c in out['changes'] if c['key'] == 'fast'])
+        self.assertEqual(out['changes'], [])
         self.assertIn('Fewer than five minutes', out['message'])
 
-    def test_previous_pass_is_judged_by_rates_since_it_was_applied(self):
-        sessions = synthetic_sessions(correction_after_fast=0.4)
-        log = [{'ts': sessions[len(sessions) // 2]['ts'], 'applied': True, 'changes': [{'key': 'fast'}], 'evidence': {'fastCorrectionRate': 0.4}, 'practiceMedianMs': 900}]
-        out = tp.propose(dict(self.CURRENT, practiceMedianMs=700), sessions, synthetic_hist(15, 90), log)
-        self.assertIsNotNone(out['previous'])
-        self.assertEqual(out['previous']['before']['fastCorrectionRate'], 0.4)
-        self.assertIn('fastCorrectionRate', out['previous']['after'])
-        self.assertEqual(out['previous']['practiceAfter'], 700)
+    def test_a_fresh_change_is_watched_and_nothing_else_is_proposed(self):
+        before = synthetic_sessions(correction_after_fast=0.4)
+        log = [self.entry('fast', 'Fast swipes', 0.6766, 0.6225, 'down', {'fastCorrectionRate': 0.4}, ts=before[-1]['ts'] + 1)]
+        after = shifted(synthetic_sessions(n_moves=40), before[-1]['ts'] + 2 - 1_000_000)
+        out = tp.propose(self.FITTED, before + after, synthetic_hist(15, 90), log)
+        self.assertEqual(out['verdict'], 'watching')
+        self.assertEqual(out['changes'], [])
+        self.assertEqual(out['previous']['judgement'], 'watching')
+        self.assertIn('40 of %d moves' % tp.JUDGE_MOVES, out['previous']['reason'])
+        self.assertEqual([q['key'] for q in out['queued']], ['fast'], 'what the data would change next is listed, not proposed')
 
-    def test_log_round_trip_and_sessions_table(self):
+    def test_a_nudge_that_lowered_its_rate_is_kept_and_the_pass_moves_on(self):
+        log = [self.entry('fast', 'Fast swipes', 0.6766, 0.6225, 'down', {'fastCorrectionRate': 0.4})]
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.1), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'kept')
+        self.assertIn('fell from 40% to 10%', out['previous']['reason'])
+        self.assertEqual(out['verdict'], 'nothing to change')
+
+    def test_a_nudge_that_did_not_help_is_undone_with_the_logged_reason(self):
+        log = [self.entry('fast', 'Fast swipes', 0.6766, 0.6225, 'down', {'fastCorrectionRate': 0.2})]
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'undo')
+        self.assertEqual(out['verdict'], 'undo')
+        c = out['changes'][0]
+        self.assertEqual((c['key'], c['from'], c['to'], c['undo'], c['reverts']), ('fast', 0.6225, 0.6766, True, 1_000_000.0))
+        self.assertIn('did not fall', c['reason'])
+        self.assertIn('puts Fast swipes back to 0.6766', c['reason'])
+        self.assertEqual(out['proposal']['curve']['fast'], 0.6766)
+        self.assertEqual([q['key'] for q in out['queued']], ['fast'], 'the data still wants Fast down; it queues behind the undo')
+
+    def test_the_opposite_fingerprint_undoes_a_raise(self):
+        log = [self.entry('fast', 'Fast swipes', 0.6225, 0.6848, 'up', {'restrokeRate': 0.3, 'fastCorrectionRate': 0.05})]
+        current = dict(self.FITTED, curve=dict(self.FITTED['curve'], fast=0.6848))
+        out = tp.propose(current, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'undo')
+        self.assertIn('opposite fingerprint', out['previous']['reason'])
+        self.assertEqual(out['changes'][0]['to'], 0.6225)
+
+    def test_a_shape_change_is_kept_unless_a_guarded_rate_rises(self):
+        log = [self.entry('start', 'Start', 1.3, 0.59, 'shape', {'correctionRate': 0.05, 'restrokeRate': 0.02})]
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.05), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'kept')
+        self.assertIn('Nothing got worse', out['previous']['reason'])
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'undo')
+        self.assertIn('Overshoot corrections rose from 5% to 20%', out['previous']['reason'])
+        self.assertEqual(out['changes'][0]['to'], 1.3)
+
+    def test_a_value_changed_by_hand_is_not_undone(self):
+        log = [self.entry('fast', 'Fast swipes', 0.6766, 0.5, 'down', {'fastCorrectionRate': 0.2})]
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'overridden')
+        self.assertEqual([c['key'] for c in out['changes']], ['fast'], 'the pass moves on to a fresh proposal')
+        self.assertFalse(out['changes'][0].get('undo'))
+
+    def test_a_stored_judgement_is_never_recomputed(self):
+        log = [self.entry('fast', 'Fast swipes', 0.6766, 0.6225, 'down', {'fastCorrectionRate': 0.2}, judgement='kept by you', judgeReason='Kept by you.')]
+        out = tp.propose(self.FITTED, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'kept by you')
+        self.assertEqual([c['key'] for c in out['changes']], ['fast'])
+        self.assertFalse(out['changes'][0].get('undo'))
+
+    def test_an_undone_change_is_held_until_as_many_moves_ask_again(self):
+        log = [{'ts': 1_000_000.0, 'applied': True, 'undo': True, 'changes': [{'key': 'fast', 'label': 'Fast swipes', 'from': 0.6225, 'to': 0.6766, 'undo': True}],
+                'evidence': {}, 'hold': {'key': 'fast', 'direction': 'down', 'moves': 900}}]
+        out = tp.propose(dict(self.FITTED, curve=dict(self.FITTED['curve'], fast=0.6766)), synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual(out['previous']['judgement'], 'kept', 'an undo is not judged')
+        self.assertEqual(out['changes'], [])
+        self.assertTrue(any('was undone' in n for n in out['notes']))
+        out = tp.propose(dict(self.FITTED, curve=dict(self.FITTED['curve'], fast=0.6766)), synthetic_sessions(n_moves=1000, correction_after_fast=0.4), synthetic_hist(15, 90), log)
+        self.assertEqual([c['key'] for c in out['changes']], ['fast'], 'enough moves asked again')
+
+    def test_log_round_trip_judgement_undo_and_keep(self):
         with tempfile.TemporaryDirectory() as directory:
             tp.STATE = Path(directory)
             self.assertEqual(tp.load_log(), [])
-            tp.optimize_applied({'changes': [{'key': 'start'}], 'evidence': {'correctionRate': 0.1}, 'practiceMedianMs': 800})
-            self.assertEqual(len(tp.load_log()), 1)
+            first = {'key': 'fast', 'label': 'Fast swipes', 'from': 0.6766, 'to': 0.6225, 'direction': 'down', 'watch': tp.watch_for('fast', 'down')}
+            msg = tp.optimize_applied({'changes': [first], 'evidence': {'fastCorrectionRate': 0.2, 'moves': 400}, 'practiceMedianMs': 800})
+            self.assertIn('%d moves' % tp.JUDGE_MOVES, msg['message'])
+            log = tp.load_log()
+            self.assertEqual(log[0]['watch']['target'], 'fastCorrectionRate')
+            # settle writes a decided judgement once
+            tp.settle(log, {'now': 5.0, 'previous': {'judgement': 'undo', 'reason': 'did not fall', 'after': {'moves': 200}}})
+            log = tp.load_log()
+            self.assertEqual((log[0]['judgement'], log[0]['judgeReason'], log[0]['judgedTs']), ('undo', 'did not fall', 5.0))
+            tp.settle(log, {'now': 9.0, 'previous': {'judgement': 'kept', 'reason': 'later', 'after': {}}})
+            self.assertEqual(tp.load_log()[0]['judgedTs'], 5.0, 'judged once')
+            # applying the undo marks the original undone and holds the key
+            tp.optimize_applied({'changes': [{'key': 'fast', 'label': 'Fast swipes', 'from': 0.6225, 'to': 0.6766, 'undo': True, 'reverts': log[0]['ts']}], 'evidence': {}})
+            log = tp.load_log()
+            self.assertEqual(log[0]['judgement'], 'undone')
+            self.assertEqual(log[1]['hold'], {'key': 'fast', 'direction': 'down', 'moves': 400})
+            self.assertIsNone(log[1]['watch'])
+            # keep-anyway only answers a pending undo
+            self.assertIn('Nothing', tp.optimize_keep({})['message'])
+            tp.optimize_applied({'changes': [first], 'evidence': {'fastCorrectionRate': 0.2, 'moves': 400}})
+            log = tp.load_log()
+            tp.settle(log, {'now': 20.0, 'previous': {'judgement': 'undo', 'reason': 'did not fall', 'after': {}}})
+            tp.optimize_keep({})
+            self.assertEqual(tp.load_log()[2]['judgement'], 'kept by you')
+            # the sessions table and the real optimize() path still round-trip
             db = tp.db_open()
             recs = [{'wall': 5.0, 'start': 0, 'end': 0.3, 'kind': 'move', 'fingers': 1, 'duration': 0.3, 'dist': 20.0, 'peak': 100.0, 'mean': 66.0, 'dx': 20.0, 'dy': 0.0, 'flag': '', 'ref': 0.0}]
             tp.record_sessions(db, recs)
             rows = tp.load_sessions(db, 0)
             self.assertEqual(rows[0]['kind'], 'move')
-            self.assertEqual(rows[0]['dist'], 20.0)
             out = tp.optimize({'profile': 'custom', 'curve': self.CURRENT['curve'], 'scrollFactor': 0.33, 'gainMaximum': 1})
             self.assertIn('verdict', out)
-            self.assertIsNotNone(out['previous'])
+            self.assertEqual(out['previous']['judgement'], 'kept by you')
 
 
 class DataFeatureTests(unittest.TestCase):

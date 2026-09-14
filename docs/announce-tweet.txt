@@ -1,6 +1,6 @@
 Trackpad Pulse for Omarchy. A bar plugin that records what your trackpad does and tunes itself to it.
 
-Optimize for my hand: libinput's custom acceleration curve has a physical x axis (1 unit = 25.4 mm/s on a touchpad). The plugin records your finger speed, draws the distribution under the curve, and proposes a curve fitted to it: Start where 45% of your movement is slower, End at the 90th percentile, gains adjusted at most 10% per pass from overshoot corrections and re-strokes it detects in your touches. Every change shows its reason and the numbers. Nothing applies until you press Apply. Each pass is logged; the next reports whether the last one helped. It re-checks every 10 minutes and lights the button when the fit changes.
+Optimize for my hand: libinput's custom acceleration curve has a physical x axis (1 unit = 25.4 mm/s on a touchpad). The plugin records your finger speed, draws the distribution under the curve, and proposes a curve fitted to it: Start where 45% of your movement is slower, End at the 90th percentile, gains adjusted at most 10% from overshoot corrections and re-strokes it detects in your touches. One change per pass. Every change shows its reason and the numbers. Nothing applies until you press Apply. Each applied change is logged with what the next pass watches; after 150 moves the next pass keeps it or proposes undoing it with the reason, and you can keep it anyway. It re-checks every 10 minutes and lights the button when the fit changes.
 
 Bar icon: the pad itself, showing finger positions live. Off state dims it.
 

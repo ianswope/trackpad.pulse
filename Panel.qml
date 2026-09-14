@@ -601,7 +601,7 @@ Panel {
   function applyProposal() {
     var p = root.proposal
     if (!p || !p.proposal) return
-    var feel = { profile: p.proposal.profile === "mac" ? "mac" : "custom", curve: Curve.copy(p.proposal.curve) }
+    var feel = { profile: p.proposal.profile || "custom", curve: Curve.copy(p.proposal.curve) }
     var curveChanged = p.changes.some(function(c) { return c.key !== "scroll" })
     var scrollChanged = p.changes.some(function(c) { return c.key === "scroll" })
     if (curveChanged) {
@@ -619,6 +619,17 @@ Panel {
     if (pulseProc.running) { root.actionStatus = "Applied; the log entry will be written on the next pass."; return }
     pulseProc.mode = "applied"
     pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-applied", JSON.stringify(entry)])
+    pulseProc.running = true
+  }
+  // You disagree with an undo: the recorder marks the change kept and the
+  // next pass moves on to the next one.
+  function keepAnyway() {
+    if (pulseProc.running) return
+    root.proposal = null
+    root.hintSeen()
+    root.actionStatus = "Keeping it…"
+    pulseProc.mode = "keep"
+    pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-keep", "{}"])
     pulseProc.running = true
   }
   function fmtValue(key, v) {
@@ -656,6 +667,7 @@ Panel {
     interval: 3000; running: true; repeat: true
     onTriggered: { root.now = Date.now() / 1000; if (root.stale) { snapshotFile.reload(); historyFile.reload() } }
   }
+  Timer { id: reoptimize; interval: 200; onTriggered: root.requestOptimize() }
   Process {
     id: pulseProc
     property string mode: "status"
@@ -666,6 +678,7 @@ Panel {
           if (pulseProc.mode === "optimize" && !r.error) { root.proposal = r; root.actionStatus = "" }
           else if (pulseProc.mode === "catalogue" && !r.error) { root.catalogue = r.actions || []; root.catalogueMeta = r; root.actionStatus = "" }
           else if (pulseProc.mode === "report" && !r.error) { root.reportData = r; root.actionStatus = "" }
+          else if (pulseProc.mode === "keep" && !r.error) { root.actionStatus = r.message || "Kept."; reoptimize.start() }
           else if (pulseProc.mode === "gestures" && !r.error) { if (r.gestures) root.setSetting("gestures", r.gestures); root.actionStatus = r.message || "Gestures applied." }
           else root.actionStatus = r.error || r.message || "Done"
         } catch (e) { root.actionStatus = "The recorder helper did not answer." }
@@ -1637,7 +1650,7 @@ Panel {
                 Label {
                   visible: !root.proposal
                   width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11
-                  text: "Fits Start and End to where your fingers live, then nudges the gains and the scroll speed by at most 10% a pass from your overshoots and re-strokes. Every pass is logged, and the next one says whether the last one helped. Nothing changes until you Apply."
+                  text: "One change a pass: Start and End to where your fingers live, then the gains and the scroll speed by at most 10% from your overshoots and re-strokes. The next pass keeps the change or proposes undoing it, with the reason logged. Nothing changes until you Apply."
                 }
                 Column {
                   visible: !!root.proposal
@@ -1658,9 +1671,19 @@ Panel {
                     }
                   }
                   Label {
-                    visible: !!root.proposal && root.proposal.changes.length === 0
+                    visible: !!root.proposal && root.proposal.verdict === "watching"
+                    width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11; color: root.ink
+                    text: root.proposal && root.proposal.previous ? "Still judging " + String(root.proposal.previous.summary || "the last pass") + ", applied " + Pulse.ago(root.proposal.previous.ts, root.now) + ": " + String(root.proposal.previous.reason || "") + " Nothing else changes until it is kept or undone." : ""
+                  }
+                  Label {
+                    visible: !!root.proposal && root.proposal.changes.length === 0 && root.proposal.verdict !== "watching"
                     width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11; color: root.ink
                     text: "Nothing to change: the shape already fits and neither overshoots nor re-strokes are running high."
+                  }
+                  Label {
+                    visible: !!root.proposal && (root.proposal.queued || []).length > 0
+                    width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+                    text: "Seen, waiting its turn: " + (root.proposal ? (root.proposal.queued || []).map(function(q) { return q.label + " " + root.fmtValue(q.key, q.from) + " → " + root.fmtValue(q.key, q.to) }).join("  ·  ") : "")
                   }
                   Repeater {
                     model: root.proposal ? root.proposal.notes : []
@@ -1676,22 +1699,23 @@ Panel {
                     }
                   }
                   Label {
-                    visible: !!(root.proposal && root.proposal.previous)
+                    visible: !!(root.proposal && root.proposal.previous) && root.proposal.verdict !== "watching"
                     width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10; color: root.ink
                     text: {
                       var q = root.proposal ? root.proposal.previous : null
                       if (!q) return ""
-                      var b = q.before || {}, a = q.after || {}
-                      var s = "Since the pass applied " + Qt.formatDateTime(new Date(Pulse.num(q.ts) * 1000), "ddd d MMM h:mm AP") + ": corrections " + Math.round(Pulse.num(b.correctionRate) * 100) + "% → " + Math.round(Pulse.num(a.correctionRate) * 100) + "%, re-strokes " + Math.round(Pulse.num(b.restrokeRate) * 100) + "% → " + Math.round(Pulse.num(a.restrokeRate) * 100) + "%"
-                      if (q.practiceBefore && q.practiceAfter) s += ", target practice " + (Pulse.num(q.practiceBefore) / 1000).toFixed(2) + " s → " + (Pulse.num(q.practiceAfter) / 1000).toFixed(2) + " s"
-                      return s + "."
+                      var when = Qt.formatDateTime(new Date(Pulse.num(q.ts) * 1000), "ddd d MMM h:mm AP")
+                      var s = "Last pass, " + when + ", " + (q.undo ? "undid " : "") + String(q.summary || "") + ": " + (q.judgement === "undo" ? "undo proposed. " : String(q.judgement || "") + ". ") + String(q.reason || "")
+                      if (q.practiceBefore && q.practiceAfter) s += " Target practice " + (Pulse.num(q.practiceBefore) / 1000).toFixed(2) + " s → " + (Pulse.num(q.practiceAfter) / 1000).toFixed(2) + " s."
+                      return s
                     }
                   }
                 }
                 Row {
                   spacing: 8
                   Action { visible: !root.proposal; text: pulseProc.running && pulseProc.mode === "optimize" ? "Reading…" : root.hintActive ? "Optimize for my hand  ·  new proposal" : "Optimize for my hand"; accent: root.tint; selected: true; opacity: root.hintActive ? root.pulseOpacity : 1; enabled: !pulseProc.running && !root.cursorOnly && !root.stale; onClicked: root.requestOptimize() }
-                  Action { visible: !!root.proposal && root.proposal.changes.length > 0; text: "Apply this"; accent: root.tint; selected: true; enabled: !(actionProc.running || root.pendingActions.length > 0); onClicked: root.applyProposal() }
+                  Action { visible: !!root.proposal && root.proposal.changes.length > 0; text: root.proposal && root.proposal.verdict === "undo" ? "Undo it" : "Apply this"; accent: root.tint; selected: true; enabled: !(actionProc.running || root.pendingActions.length > 0); onClicked: root.applyProposal() }
+                  Action { visible: !!root.proposal && root.proposal.verdict === "undo"; text: "Keep it anyway"; enabled: !pulseProc.running; onClicked: root.keepAnyway() }
                   Action { visible: !!root.proposal; text: root.proposal && root.proposal.changes.length > 0 ? "Dismiss" : "Close"; onClicked: { root.proposal = null; root.hintSeen() } }
                   Label { visible: root.cursorOnly || root.stale; anchors.verticalCenter: parent.verticalCenter; font.pixelSize: 10; text: root.stale ? "needs the recorder" : "needs pad access, not cursor-only" }
                 }
@@ -1960,7 +1984,8 @@ Panel {
                 Label {
                   required property var modelData
                   width: optColumn2.width; font.pixelSize: 11; color: root.ink
-                  text: Qt.formatDateTime(new Date(Pulse.num(modelData.ts) * 1000), "ddd d MMM h:mm AP") + "  ·  " + String(modelData.verdict || "") + "  ·  changed " + ((modelData.changes || []).join(", ") || "nothing") + (modelData.before !== null && modelData.before !== undefined ? "  ·  corrections were " + Math.round(Pulse.num(modelData.before) * 100) + "% of long moves at the time" : "")
+                  elide: Text.ElideRight
+                  text: Qt.formatDateTime(new Date(Pulse.num(modelData.ts) * 1000), "ddd d MMM h:mm AP") + "  ·  " + (modelData.undo ? "undid " : "changed ") + ((modelData.changes || []).join(", ") || "nothing") + "  ·  " + (modelData.judgement === "watching" ? "being judged" : modelData.judgement === "undo" ? "undo proposed" : String(modelData.judgement || "")) + (modelData.reason ? "  ·  " + String(modelData.reason) : "")
                 }
               }
               Label { visible: (reportPage.rp.optimize || []).length === 0; width: parent.width; font.pixelSize: 11; text: "No Optimize pass applied yet. Pointer feel has the button." }

@@ -130,6 +130,16 @@ OPTIMIZE_LOG = 'optimize-log.json'
 # Gain nudges per pass, so the loop converges instead of lurching.
 NUDGE_DOWN = 0.92
 NUDGE_UP = 1.10
+# One change a pass. The next pass judges it once it has seen this much, and
+# undoes it when the rate it was meant to lower rose by WORSE_BY or the
+# opposite fingerprint crossed its own trigger.
+JUDGE_MOVES = 150
+JUDGE_SECONDS = 180
+WORSE_BY = 0.05
+HELPED_BY = 0.02
+METRIC_NAMES = {'correctionRate': ('overshoot corrections', 'long moves'), 'restrokeRate': ('re-strokes', 'long moves'),
+                'fastCorrectionRate': ('overshoots after fast moves', 'fast moves'), 'slowCorrectionRate': ('corrections after slow moves', 'slow moves'),
+                'scrollReversalRate': ('scroll reversals', 'scrolls'), 'scrollRestrokeRate': ('repeated scrolls', 'scrolls')}
 
 
 def zero_counters():
@@ -754,7 +764,8 @@ def report(db, today, log, now):
             'palms': {'today': today['counts']['palms'], 'x': round(today.get('palmX', 0.0) / max(1, today.get('palmN', 0)), 2) if today.get('palmN') else None},
             'autoOff': {'today': today.get('autoOff', 0)},
             'optimize': [{'ts': e['ts'], 'changes': [c.get('label', c.get('key')) for c in e.get('changes', [])], 'before': (e.get('evidence') or {}).get('correctionRate'),
-                          'verdict': e.get('verdict', '')} for e in (log or []) if e.get('applied')][-5:]}
+                          'verdict': e.get('verdict', ''), 'judgement': e.get('judgement') or ('undo' if e.get('undo') else 'watching'),
+                          'reason': e.get('judgeReason', ''), 'undo': bool(e.get('undo'))} for e in (log or []) if e.get('applied')][-5:]}
 
 
 WINDOW_KEYS = ('distance', 'touches', 'taps', 'clicks', 'active')
@@ -1247,11 +1258,94 @@ def rates(sessions, start_mm, end_mm):
             'scrollRestrokeRate': rate(sum(1 for s in scrolls if s['flag'] == 'scrollRestroke'), len(scrolls))}
 
 
+def watch_for(key, direction):
+    """What the next pass watches to keep or undo this change.
+
+    A nudge must earn its keep: the rate it targets has to fall. A shape change
+    (Start, End, a first fit) is kept unless a guarded rate rises by WORSE_BY.
+    Either is undone when the opposite fingerprint crosses its own trigger.
+    """
+    if key == 'fast':
+        return ({'target': 'fastCorrectionRate', 'guard': [], 'opposite': {'metric': 'restrokeRate', 'threshold': 0.12}} if direction == 'down'
+                else {'target': 'restrokeRate', 'guard': [], 'opposite': {'metric': 'fastCorrectionRate', 'threshold': 0.20}})
+    if key == 'precision':
+        return {'target': 'slowCorrectionRate', 'guard': [], 'opposite': None}
+    if key == 'scroll':
+        return ({'target': 'scrollReversalRate', 'guard': [], 'opposite': {'metric': 'scrollRestrokeRate', 'threshold': 0.30}} if direction == 'down'
+                else {'target': 'scrollRestrokeRate', 'guard': [], 'opposite': {'metric': 'scrollReversalRate', 'threshold': 0.25}})
+    return {'target': None, 'guard': ['correctionRate', 'restrokeRate'], 'opposite': None}
+
+
+def fmt_value(v):
+    """A setting for a sentence: 0.7641474222 → 0.7641, None → an em dash."""
+    if v is None:
+        return '—'
+    if isinstance(v, float):
+        return ('%.4f' % v).rstrip('0').rstrip('.') or '0'
+    return str(v)
+
+
+def watch_of(entry):
+    """The watch spec of a log entry; derived from the change itself for rows written before 1.5.0."""
+    if entry.get('watch'):
+        return entry['watch']
+    head = (entry.get('changes') or [{}])[0]
+    if head.get('watch'):
+        return head['watch']
+    direction = head.get('direction')
+    if not direction:
+        frm, to = head.get('from'), head.get('to')
+        direction = 'shape' if head.get('key') in ('profile', 'start', 'end') or frm is None or to is None else 'down' if float(to) < float(frm) else 'up'
+    return watch_for(head.get('key'), direction)
+
+
+def judge(entry, after, moving):
+    """Keep or undo the last applied change, by the rates since it was applied. Pure.
+
+    Returns {'judgement': 'watching' | 'kept' | 'undo', 'reason': str}. One
+    decision per change: the callers write it into the log and never re-judge.
+    """
+    if entry.get('undo'):
+        return {'judgement': 'kept', 'reason': 'An undo puts back a value that was already judged; it is not judged again.'}
+    watch = watch_of(entry)
+    if after['moves'] < JUDGE_MOVES or moving < JUDGE_SECONDS:
+        return {'judgement': 'watching', 'reason': '%d of %d moves and %.0f of %d s of movement seen since it was applied.' % (after['moves'], JUDGE_MOVES, moving, JUDGE_SECONDS)}
+    before = entry.get('evidence') or {}
+
+    def pct(v):
+        return '%.0f%%' % (float(v or 0) * 100)
+    for metric in watch.get('guard') or []:
+        b, a = float(before.get(metric) or 0), float(after.get(metric) or 0)
+        name, of = METRIC_NAMES.get(metric, (metric, 'moves'))
+        if a - b > WORSE_BY:
+            return {'judgement': 'undo', 'reason': '%s rose from %s to %s of %s over the %d moves since it was applied.' % (name.capitalize(), pct(b), pct(a), of, after['moves'])}
+    opp = watch.get('opposite')
+    if opp:
+        b, a = float(before.get(opp['metric']) or 0), float(after.get(opp['metric']) or 0)
+        name, of = METRIC_NAMES.get(opp['metric'], (opp['metric'], 'moves'))
+        if a > opp['threshold'] >= b:
+            return {'judgement': 'undo', 'reason': 'The opposite fingerprint appeared: %s went from %s to %s of %s, past the %s trigger.' % (name, pct(b), pct(a), of, pct(opp['threshold']))}
+    target = watch.get('target')
+    if target:
+        b, a = float(before.get(target) or 0), float(after.get(target) or 0)
+        name, of = METRIC_NAMES.get(target, (target, 'moves'))
+        if a > b - HELPED_BY:
+            return {'judgement': 'undo', 'reason': '%s did not fall: %s of %s before, %s over the %d moves since. A nudge that did not help is undone.' % (name.capitalize(), pct(b), of, pct(a), after['moves'])}
+        return {'judgement': 'kept', 'reason': '%s fell from %s to %s of %s over the %d moves since it was applied.' % (name.capitalize(), pct(b), pct(a), of, after['moves'])}
+    parts = ['%s %s → %s' % (METRIC_NAMES.get(m, (m, ''))[0], pct(before.get(m)), pct(after.get(m))) for m in watch.get('guard') or []]
+    return {'judgement': 'kept', 'reason': 'Nothing got worse over the %d moves since it was applied: %s.' % (after['moves'], ', '.join(parts) or 'no fingerprint rose')}
+
+
 def propose(current, sessions, hist, log=None, now=None):
     """What to change and why. Pure: settings in, proposal out, nothing applied.
 
     current: {profile, curve:{precision,start,end,fast}, scrollFactor (slider 0.01..1),
               scrollScale, gainMaximum}. Start/End are in the editor's 0..4 units.
+
+    One change a pass. The last applied change is judged first; while it is
+    still being watched nothing new is proposed, and when it made things worse
+    the only proposal is to undo it, carrying the logged reason. Everything
+    else the data would change is listed as queued for a later pass.
     """
     now = time.time() if now is None else now
     curve = dict(current.get('curve') or {'precision': 0.3, 'start': 0.8, 'end': 2.8, 'fast': 1.6})
@@ -1264,13 +1358,35 @@ def propose(current, sessions, hist, log=None, now=None):
     start_mm = curve['start'] * MM_PER_UNIT_MS if custom else p45
     end_mm = curve['end'] * MM_PER_UNIT_MS if custom else p90
     r = rates(sessions, start_mm, end_mm)
-    changes, notes = [], []
+    candidates, notes = [], []
     proposal = {'curve': dict(curve), 'scrollFactor': scroll, 'profile': 'custom' if custom else profile}
 
     enough = moving >= 300 and r['moves'] >= 200
     confidence = 'high' if moving >= 1800 and r['longMoves'] >= 600 else 'medium' if enough else 'low'
 
+    def value_of(key):
+        return scroll if key == 'scroll' else profile if key == 'profile' else curve.get(key)
+
+    # 0. The last applied change, judged once by the same rates since it was applied.
+    previous, hold = None, None
+    applied = [e for e in (log or []) if e.get('applied')]
+    if applied:
+        last = applied[-1]
+        after = rates([s for s in sessions if s['ts'] >= last['ts']], start_mm, end_mm)
+        stored = last.get('judgement')
+        j = {'judgement': stored, 'reason': last.get('judgeReason', '')} if stored else judge(last, after, moving)
+        head = last.get('changes') or []
+        if j['judgement'] == 'undo' and head and any(abs(float(value_of(c['key']) or 0) - float(c.get('to') or 0)) > 1e-6 if c['key'] != 'profile' else value_of('profile') != c.get('to') for c in head):
+            j = {'judgement': 'overridden', 'reason': 'You changed it by hand since the pass; there is nothing to undo.'}
+        previous = {'ts': last['ts'], 'changes': head, 'before': last.get('evidence') or {}, 'after': last.get('after') or after,
+                    'practiceBefore': last.get('practiceMedianMs'), 'practiceAfter': current.get('practiceMedianMs'),
+                    'judgement': j['judgement'], 'reason': j['reason'], 'undo': bool(last.get('undo')),
+                    'summary': ', '.join('%s %s → %s' % (c.get('label', c['key']), fmt_value(c.get('from')), fmt_value(c.get('to'))) for c in head)}
+        if last.get('undo') and last.get('hold'):
+            hold = last['hold']
+
     # 1. The shape: Start where 45% of movement is slower, End at the 90th percentile.
+    first_fit = []
     if moving > 0:
         new_start = round(min(3.6, max(0.0, p45 / MM_PER_UNIT_MS)), 2)
         new_end = round(min(4.0, max(new_start + 0.2, p90 / MM_PER_UNIT_MS)), 2)
@@ -1279,21 +1395,20 @@ def propose(current, sessions, hist, log=None, now=None):
             factor = min(1.0, gain_max / base['fast'])
             base['precision'] = max(0.01, round(base['precision'] * factor, 4))
             base['fast'] = round(base['fast'] * factor, 4)
-            proposal['curve'] = base
-            proposal['profile'] = 'custom'
-            changes.append({'key': 'profile', 'label': 'Profile', 'from': profile, 'to': 'custom',
-                            'reason': 'A custom curve is the only place Start and End exist; gains start from the Mac-inspired preset.'})
-            changes.append({'key': 'start', 'label': 'Start', 'from': None, 'to': new_start, 'reason': '45%% of your movement is slower than %.0f mm/s; below that the curve stays at precision gain.' % p45})
-            changes.append({'key': 'end', 'label': 'End', 'from': None, 'to': new_end, 'reason': '90%% of your movement is slower than %.0f mm/s; the fastest tenth gets full gain.' % p90})
+            first_fit = [{'key': 'profile', 'label': 'Profile', 'from': profile, 'to': 'custom', 'direction': 'shape',
+                          'reason': 'A custom curve is the only place Start and End exist; gains start from the Mac-inspired preset.'},
+                         {'key': 'start', 'label': 'Start', 'from': None, 'to': new_start, 'direction': 'shape', 'reason': '45%% of your movement is slower than %.0f mm/s; below that the curve stays at precision gain.' % p45},
+                         {'key': 'end', 'label': 'End', 'from': None, 'to': new_end, 'direction': 'shape', 'reason': '90%% of your movement is slower than %.0f mm/s; the fastest tenth gets full gain.' % p90}]
+            for c in first_fit:
+                c['watch'] = watch_for(c['key'], 'shape')
+            candidates.append({'key': 'fit', 'rank': (0, 0), 'records': first_fit, 'proposal': {'curve': base, 'profile': 'custom'}})
         else:
             if abs(new_start - curve['start']) >= 0.02:
-                changes.append({'key': 'start', 'label': 'Start', 'from': curve['start'], 'to': new_start, 'reason': '45%% of your movement is slower than %.0f mm/s; Start sits there so half of what you do stays precise.' % p45})
-                proposal['curve']['start'] = new_start
+                candidates.append({'key': 'start', 'rank': (0, -abs(p45 - start_mm)), 'records': [{'key': 'start', 'label': 'Start', 'from': curve['start'], 'to': new_start, 'direction': 'shape',
+                                   'reason': '45%% of your movement is slower than %.0f mm/s; Start sits there so half of what you do stays precise.' % p45}], 'proposal': {'curve': {'start': new_start}}})
             if abs(new_end - curve['end']) >= 0.02:
-                changes.append({'key': 'end', 'label': 'End', 'from': curve['end'], 'to': new_end, 'reason': '90%% of your movement is slower than %.0f mm/s; only the fastest tenth needs full gain.' % p90})
-                proposal['curve']['end'] = new_end
-            if proposal['curve']['end'] < proposal['curve']['start'] + 0.2:
-                proposal['curve']['end'] = round(min(4.0, proposal['curve']['start'] + 0.2), 2)
+                candidates.append({'key': 'end', 'rank': (0, -abs(p90 - end_mm)), 'records': [{'key': 'end', 'label': 'End', 'from': curve['end'], 'to': new_end, 'direction': 'shape',
+                                   'reason': '90%% of your movement is slower than %.0f mm/s; only the fastest tenth needs full gain.' % p90}], 'proposal': {'curve': {'end': new_end}}})
 
     # 2. The gains, from the fingerprints, one bounded nudge at a time.
     if custom and enough:
@@ -1303,52 +1418,93 @@ def propose(current, sessions, hist, log=None, now=None):
             notes.append('Re-strokes and overshoots after fast moves both run high (%.0f%% and %.0f%%); they cancel, so Fast swipes is left alone this pass.' % (r['restrokeRate'] * 100, r['fastCorrectionRate'] * 100))
         elif fast_down:
             new_fast = round(max(curve['precision'], curve['fast'] * NUDGE_DOWN), 4)
-            changes.append({'key': 'fast', 'label': 'Fast swipes', 'from': curve['fast'], 'to': new_fast, 'reason': '%.0f%% of fast moves were answered by an overshoot correction; the cursor is going too far at speed.' % (r['fastCorrectionRate'] * 100)})
-            proposal['curve']['fast'] = new_fast
+            candidates.append({'key': 'fast', 'rank': (1, 0), 'records': [{'key': 'fast', 'label': 'Fast swipes', 'from': curve['fast'], 'to': new_fast, 'direction': 'down',
+                               'reason': '%.0f%% of fast moves were answered by an overshoot correction; the cursor is going too far at speed.' % (r['fastCorrectionRate'] * 100)}], 'proposal': {'curve': {'fast': new_fast}}})
         elif fast_up:
             new_fast = round(curve['fast'] * NUDGE_UP, 4)
             if new_fast > gain_max:
                 notes.append('%.0f%% of long moves were re-strokes, but Fast swipes is already at the %.2f× ceiling; raise Device scale to go further.' % (r['restrokeRate'] * 100, gain_max))
             else:
-                changes.append({'key': 'fast', 'label': 'Fast swipes', 'from': curve['fast'], 'to': new_fast, 'reason': '%.0f%% of long moves were re-strokes: the pad ran out before the cursor arrived.' % (r['restrokeRate'] * 100)})
-                proposal['curve']['fast'] = new_fast
+                candidates.append({'key': 'fast', 'rank': (1, 0), 'records': [{'key': 'fast', 'label': 'Fast swipes', 'from': curve['fast'], 'to': new_fast, 'direction': 'up',
+                                   'reason': '%.0f%% of long moves were re-strokes: the pad ran out before the cursor arrived.' % (r['restrokeRate'] * 100)}], 'proposal': {'curve': {'fast': new_fast}}})
         if r['slowCorrectionRate'] > 0.25 and r['slowMoves'] >= 30:
             new_prec = round(max(0.01, curve['precision'] * NUDGE_DOWN), 4)
-            changes.append({'key': 'precision', 'label': 'Precision', 'from': curve['precision'], 'to': new_prec, 'reason': '%.0f%% of slow moves were followed by a correction; fine work is overshooting.' % (r['slowCorrectionRate'] * 100)})
-            proposal['curve']['precision'] = new_prec
-        if proposal['curve']['fast'] < proposal['curve']['precision']:
-            proposal['curve']['fast'] = proposal['curve']['precision']
+            candidates.append({'key': 'precision', 'rank': (2, 0), 'records': [{'key': 'precision', 'label': 'Precision', 'from': curve['precision'], 'to': new_prec, 'direction': 'down',
+                               'reason': '%.0f%% of slow moves were followed by a correction; fine work is overshooting.' % (r['slowCorrectionRate'] * 100)}], 'proposal': {'curve': {'precision': new_prec}}})
 
     # 3. Scroll speed, same two signals.
     if r['scrolls'] >= 40:
         if r['scrollReversalRate'] > 0.25:
             new_scroll = round(max(0.01, scroll * NUDGE_DOWN), 2)
-            changes.append({'key': 'scroll', 'label': 'Scroll speed', 'from': scroll, 'to': new_scroll, 'reason': '%.0f%% of scrolls were reversed at once; content is flying past.' % (r['scrollReversalRate'] * 100)})
-            proposal['scrollFactor'] = new_scroll
+            candidates.append({'key': 'scroll', 'rank': (3, 0), 'records': [{'key': 'scroll', 'label': 'Scroll speed', 'from': scroll, 'to': new_scroll, 'direction': 'down',
+                               'reason': '%.0f%% of scrolls were reversed at once; content is flying past.' % (r['scrollReversalRate'] * 100)}], 'proposal': {'scrollFactor': new_scroll}})
         elif r['scrollRestrokeRate'] > 0.30:
             new_scroll = round(min(1.0, scroll * NUDGE_UP), 2)
-            changes.append({'key': 'scroll', 'label': 'Scroll speed', 'from': scroll, 'to': new_scroll, 'reason': '%.0f%% of scrolls were immediately repeated in the same direction; each one is not going far enough.' % (r['scrollRestrokeRate'] * 100)})
-            proposal['scrollFactor'] = new_scroll
+            candidates.append({'key': 'scroll', 'rank': (3, 0), 'records': [{'key': 'scroll', 'label': 'Scroll speed', 'from': scroll, 'to': new_scroll, 'direction': 'up',
+                               'reason': '%.0f%% of scrolls were immediately repeated in the same direction; each one is not going far enough.' % (r['scrollRestrokeRate'] * 100)}], 'proposal': {'scrollFactor': new_scroll}})
 
-    # 4. What the last pass did, judged by the same rates since it was applied.
-    previous = None
-    applied = [e for e in (log or []) if e.get('applied')]
-    if applied:
-        last = applied[-1]
-        after = rates([s for s in sessions if s['ts'] >= last['ts']], start_mm, end_mm)
-        before = last.get('evidence') or {}
-        previous = {'ts': last['ts'], 'changes': last.get('changes', []), 'before': before, 'after': after,
-                    'practiceBefore': last.get('practiceMedianMs'), 'practiceAfter': current.get('practiceMedianMs')}
+    for cand in candidates:
+        for c in cand['records']:
+            c.setdefault('watch', watch_for(c['key'], c['direction']))
+    candidates.sort(key=lambda c: c['rank'])
 
-    if not changes:
-        verdict = 'nothing to change' if enough else 'nothing to change yet'
-    elif not custom:
-        verdict = 'first fit'
+    # 4. An undone change is held: the same nudge is not offered again until as
+    # many moves as first asked for it say so a second time.
+    if hold and r['moves'] < int(hold.get('moves') or 0):
+        held = [c for c in candidates if c['key'] == hold.get('key') and c['records'][0].get('direction') == hold.get('direction')]
+        if held:
+            candidates = [c for c in candidates if c not in held]
+            notes.append('%s was undone; the same change waits until %d more moves ask for it again (%d seen).' % (held[0]['records'][0]['label'], int(hold['moves']) - r['moves'], r['moves']))
+
+    def as_queued(cand):
+        return [{'key': c['key'], 'label': c['label'], 'from': c['from'], 'to': c['to'], 'reason': c['reason']} for c in cand['records']]
+
+    # 5. One change. The last one first, if it is still open.
+    changes, queued = [], []
+    if previous and previous['judgement'] == 'watching':
+        verdict = 'watching'
+        queued = [q for cand in candidates for q in as_queued(cand)]
+    elif previous and previous['judgement'] == 'undo':
+        verdict = 'undo'
+        head = previous['changes']
+        if head and head[0]['key'] == 'profile':
+            back = head[0]['from'] or 'adaptive'
+            proposal['profile'] = back
+            changes = [{'key': 'profile', 'label': 'Profile', 'from': 'custom', 'to': back, 'direction': 'undo', 'undo': True, 'reverts': previous['ts'],
+                        'reason': previous['reason'] + ' Undo goes back to the %s profile.' % back}]
+        else:
+            for c in head:
+                if c['key'] == 'scroll':
+                    proposal['scrollFactor'] = c['from']
+                else:
+                    proposal['curve'][c['key']] = c['from']
+                changes.append({'key': c['key'], 'label': c.get('label', c['key']), 'from': c['to'], 'to': c['from'], 'direction': 'undo', 'undo': True, 'reverts': previous['ts'],
+                                'reason': previous['reason'] + ' Undo puts %s back to %s.' % (c.get('label', c['key']), fmt_value(c['from']))})
+        queued = [q for cand in candidates for q in as_queued(cand)]
+    elif candidates:
+        first = candidates[0]
+        changes = first['records']
+        for key, val in first['proposal'].items():
+            if key == 'curve':
+                proposal['curve'].update(val)
+            else:
+                proposal[key] = val
+        if proposal['curve']['end'] < proposal['curve']['start'] + 0.2:
+            proposal['curve']['end'] = round(min(4.0, proposal['curve']['start'] + 0.2), 2)
+        if proposal['curve']['fast'] < proposal['curve']['precision']:
+            proposal['curve']['fast'] = proposal['curve']['precision']
+        queued = [q for cand in candidates[1:] for q in as_queued(cand)]
+        if first['key'] == 'fit':
+            verdict = 'first fit'
+            notes.append('A first fit sets the profile, Start and End together: a custom curve cannot exist with only one of them. From here on it is one change a pass.')
+        else:
+            verdict = 'fit' if first['key'] in ('start', 'end') else 'nudge'
     else:
-        verdict = 'fit' if all(c['key'] in ('start', 'end') for c in changes) else 'nudge'
+        verdict = 'nothing to change' if enough else 'nothing to change yet'
+
     message = ('%.0f minutes of movement and %d moves in the window. ' % (moving / 60, r['moves'])
                + ('' if enough else 'Fewer than five minutes of movement or 200 moves: the shape can be fitted, the gains wait for more data. '))
-    return {'verdict': verdict, 'confidence': confidence, 'proposal': proposal, 'changes': changes, 'notes': notes, 'message': message.strip(),
+    return {'verdict': verdict, 'confidence': confidence, 'proposal': proposal, 'changes': changes, 'queued': queued, 'notes': notes, 'message': message.strip(),
             'evidence': dict(r, movingSeconds=round(moving, 1), p45=round(p45, 1), median=round(p50, 1), p90=round(p90, 1),
                              startMm=round(start_mm, 1), endMm=round(end_mm, 1)),
             'previous': previous, 'now': now}
@@ -1362,6 +1518,18 @@ def load_log():
         return []
 
 
+def settle(log, p):
+    """Write a decided judgement of the last applied pass into the log, once, so it is never re-judged."""
+    prev = p.get('previous')
+    if not prev or prev['judgement'] == 'watching':
+        return
+    applied = [e for e in log if e.get('applied')]
+    if not applied or applied[-1].get('judgement'):
+        return
+    applied[-1].update({'judgement': prev['judgement'], 'judgeReason': prev['reason'], 'judgedTs': p['now'], 'after': prev['after']})
+    atomic(STATE, OPTIMIZE_LOG, log[-50:])
+
+
 def optimize(current):
     db = db_open()
     now = time.time()
@@ -1372,15 +1540,43 @@ def optimize(current):
     # not outvote a week of the new curve; the first pass sees the whole week.
     if applied:
         since = max(since, applied[-1]['ts'])
-    return propose(current, load_sessions(db, since), load_hist(db, since), log, now)
+    p = propose(current, load_sessions(db, since), load_hist(db, since), log, now)
+    settle(log, p)
+    return p
 
 
 def optimize_applied(entry):
     log = load_log()
-    log.append({'ts': time.time(), 'applied': True, 'changes': entry.get('changes', []), 'evidence': entry.get('evidence', {}),
-                'practiceMedianMs': entry.get('practiceMedianMs'), 'verdict': entry.get('verdict', '')})
+    changes = entry.get('changes', [])
+    head = changes[0] if changes else {}
+    row = {'ts': time.time(), 'applied': True, 'changes': changes, 'evidence': entry.get('evidence', {}),
+           'practiceMedianMs': entry.get('practiceMedianMs'), 'verdict': entry.get('verdict', ''), 'watch': head.get('watch')}
+    if head.get('undo'):
+        original = next((e for e in log if e.get('applied') and e.get('ts') == head.get('reverts')), None)
+        if original:
+            original['judgement'] = 'undone'
+            original['judgeReason'] = (original.get('judgeReason') or '') + ' Undone.'
+        first = (original or {}).get('changes') or [{}]
+        row.update({'undo': True, 'reverts': head.get('reverts'), 'watch': None,
+                    'hold': {'key': first[0].get('key'), 'direction': first[0].get('direction'), 'moves': int(((original or {}).get('evidence') or {}).get('moves') or 0)}})
+        message = 'Undone and logged. The same change waits until as many moves ask for it again.'
+    else:
+        message = 'Applied and logged. After %d moves and %d s of movement the next pass keeps it or undoes it, and says why.' % (JUDGE_MOVES, JUDGE_SECONDS)
+    log.append(row)
     atomic(STATE, OPTIMIZE_LOG, log[-50:])
-    return {'message': 'Applied and logged. The next Optimize reports whether this one helped.'}
+    return {'message': message}
+
+
+def optimize_keep(entry):
+    """You disagree with an undo: keep the change and let the optimizer move on."""
+    log = load_log()
+    applied = [e for e in log if e.get('applied')]
+    if not applied or applied[-1].get('judgement') != 'undo':
+        return {'message': 'Nothing is waiting to be undone.'}
+    applied[-1]['judgement'] = 'kept by you'
+    applied[-1]['judgeReason'] = (applied[-1].get('judgeReason') or '') + ' Kept by you.'
+    atomic(STATE, OPTIMIZE_LOG, log[-50:])
+    return {'message': 'Kept. The next pass moves on to the next change.'}
 
 
 # ---- the standing check: does the best curve differ from the one in use? ------
@@ -1410,7 +1606,8 @@ def write_hint(db, now):
     applied = [e for e in log if e.get('applied')]
     since = max(now - RETENTION, applied[-1]['ts'] if applied else 0)
     p = propose(current, load_sessions(db, since), load_hist(db, since), log, now)
-    summary = ' · '.join('%s %s → %s' % (c['label'], '—' if c['from'] is None else c['from'], c['to']) for c in p['changes'])
+    settle(log, p)
+    summary = ('Undo ' if p['verdict'] == 'undo' else '') + ' · '.join('%s %s → %s' % (c['label'], fmt_value(c['from']), fmt_value(c['to'])) for c in p['changes'])
     atomic(STATE, 'hint.json', {'ts': now, 'device': current.get('device'), 'verdict': p['verdict'], 'confidence': p['confidence'],
                                 'changes': p['changes'], 'signature': hint_signature(p['changes']), 'summary': summary,
                                 'movingSeconds': p['evidence'].get('movingSeconds', 0)})
@@ -1840,7 +2037,7 @@ def one_shot():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
-                                           'optimize', 'optimize-applied', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
+                                           'optimize', 'optimize-applied', 'optimize-keep', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
                                            'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'open-fullscreen'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
@@ -1854,14 +2051,14 @@ def main():
         if args.action == 'udev-rule':
             print(UDEV_RULE, end='')
             return
-        if args.action in ('optimize', 'optimize-applied', 'gestures-apply'):
+        if args.action in ('optimize', 'optimize-applied', 'optimize-keep', 'gestures-apply'):
             try:
                 payload = json.loads(args.payload or '{}')
             except ValueError:
                 raise RuntimeError('This action needs a JSON payload.')
             if not isinstance(payload, dict):
                 raise RuntimeError('The payload must be an object.')
-            value = {'optimize': optimize, 'optimize-applied': optimize_applied, 'gestures-apply': gestures_apply}[args.action](payload)
+            value = {'optimize': optimize, 'optimize-applied': optimize_applied, 'optimize-keep': optimize_keep, 'gestures-apply': gestures_apply}[args.action](payload)
         elif args.action == 'hint':
             write_hint(db_open(), time.time())
             value = json.loads((STATE / 'hint.json').read_text())

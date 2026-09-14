@@ -2,6 +2,13 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.5.0 — 2026-09-14
+
+- **One change a pass, judged by the next.** Optimize now proposes a single change: the bigger miss of Start and End first, then Fast swipes, Precision, Scroll speed. Everything else the data would change is listed as *seen, waiting its turn*. The only exception is the first fit of a System or Flat profile, which sets the profile, Start and End together because a custom curve cannot exist with only one of them.
+- **A logged reason to undo.** Every applied change carries what the next pass watches. A nudge must earn its keep: the rate it targeted has to fall by at least 2 points. A shape change is kept unless overshoot corrections or re-strokes rise by 5 points. Either is undone when the opposite fingerprint crosses its own trigger. The pass waits for 150 moves and 3 minutes of movement before judging, proposes nothing new while it waits, and writes the verdict and its reason into the log once. When the verdict is undo, the proposal is the undo itself with that reason, behind **Undo it**, and **Keep it anyway** logs your disagreement and moves on. An undone change is held until as many moves ask for it again. A value you changed by hand in the meantime is left alone.
+- Report: the optimize history shows each pass's verdict and reason.
+- Recorder: `optimize-keep` action; log rows carry `watch`, `judgement`, `judgeReason`, `hold`.
+
 ## 1.4.1 — 2026-09-14
 
 - Overview: the touch heatmap now sits in the hero card beside the touch count, in the span left of the live speed readout.

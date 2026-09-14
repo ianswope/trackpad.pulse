@@ -66,7 +66,7 @@ Everything else on this page is David Fano's editor exactly as he built it: Syst
 ### Optimize for my hand
 
 <div align="center">
-<img src="assets/screenshots/optimize.png" width="900" alt="The Optimize for my hand card: proposed Start and End with the reasons, the overshoot and re-stroke evidence, and Apply this / Dismiss">
+<img src="assets/screenshots/optimize.png" width="900" alt="Pointer feel with the Optimize for my hand card still judging the last applied change, the next change seen and waiting its turn, and the overshoot and re-stroke evidence">
 </div>
 
 A wrong curve leaves fingerprints, and the recorder reads them. A long move answered at once by a short move back the other way is an **overshoot correction**: the cursor went too far at that speed. A long move continued at once in the same direction is a **re-stroke**: the pad ran out before the cursor arrived. Two-finger scrolls have the same two tells.
@@ -76,7 +76,11 @@ Press **Optimize for my hand** and the recorder reads the week since your last a
 - **Start** at the speed below which 45% of your movement happens, **End** at the 90th percentile. The shape of the curve fitted to the shape of your hand.
 - **Fast swipes** down 8% when more than a fifth of your fast moves end in an overshoot, or up 10% when more than an eighth of your long moves are re-strokes. **Precision** down 8% when slow moves keep overshooting. **Scroll speed** the same way from reversals and repeats.
 
-Every change comes with its reason and the numbers behind it. Nothing changes until you press **Apply this**, which goes through Trackpad Plus's journalled path, so **Restore previous** still undoes it. Each pass is bounded, so the loop converges instead of lurching, and each applied pass is logged: the next one reports whether the last one helped, by the same rates since it was applied and by the target-practice time the editor now measures. Thin data fits the shape and withholds the gains, and says so.
+**One change a pass.** The proposal is a single change: the bigger miss of Start and End first, then Fast swipes, Precision, Scroll speed. Everything else the data would change is listed as *seen, waiting its turn*. The only exception is the first fit of a System or Flat profile, which sets the profile, Start and End together, because a custom curve cannot exist with only one of them.
+
+**The next pass decides whether to keep it.** Every applied change is logged with what the next pass will watch. A nudge must earn its keep: the rate it targeted has to fall. A shape change is kept unless overshoot corrections or re-strokes rise. Either is undone when the opposite fingerprint appears. The pass waits for 150 moves and three minutes of movement before judging, proposes nothing new while it waits, and writes the verdict and its reason into the log once. When the verdict is undo, the proposal is the undo itself, carrying that reason, behind **Undo it**; **Keep it anyway** logs your disagreement and the loop moves on. An undone change is held until as many moves ask for it again, and a value you changed by hand in the meantime is left alone.
+
+Every change comes with its reason and the numbers behind it. Nothing changes until you press **Apply this**, which goes through Trackpad Plus's journalled path, so **Restore previous** still undoes it. Thin data fits the shape and withholds the gains, and says so.
 
 It cannot tune taps, natural scrolling or the right-click switch; those are preferences with no signal in the touch stream.
 
@@ -113,7 +117,7 @@ Distance travelled, touches, taps, clicks and active time over the trailing minu
 
 ## Report
 
-This week against last: distance, touches, clicks and active time, a bar per day, busiest day and hour, palms rejected, and every Optimize pass with what it changed. Three readings only a week of data can give:
+This week against last: distance, touches, clicks and active time, a bar per day, busiest day and hour, palms rejected, and every Optimize pass with what it changed, its verdict and the reason. Three readings only a week of data can give:
 
 - **Your hand.** A right hand parks its thumb bottom-left and drops its heel bottom-right; a left hand mirrors it. The heatmap and the rejected palms vote, and the verdict comes with its reasons and a confidence.
 - **Mouse vs trackpad.** Cursor motion with no finger on the pad is a mouse. The share of your active time on each, and an opt-in **auto-off**: after 15 seconds of mouse use the pad is switched off through Trackpad Plus's own per-device setting, and a tap or a real move on the pad switches it straight back on. The kernel keeps reporting the pad while Hyprland ignores it, which is what makes the way back possible.
