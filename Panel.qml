@@ -1,17 +1,29 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import "Model.js" as Model
 import "Curve.js" as Curve
+import "Pulse.js" as Pulse
 
+// Trackpad Pulse: a trackpad that shows you what your fingers are doing, on
+// top of Trackpad Plus's per-device controls and pointer-feel editor.
+//
+// Two halves, kept deliberately separate:
+//   * settings — David Fano's trackpads.py and the action queue below it,
+//     unchanged in behaviour: every write is scoped to one device, debounced,
+//     journalled and rolled back on failure;
+//   * telemetry — the Trackpad Pulse recorder (collectors/trackpad_pulse.py),
+//     a user service that reads the pad's own event node and writes
+//     snapshot / live / history files this panel only ever reads.
 Panel {
   id: root
-  moduleName: "davefano.trackpad-plus"
-  ipcTarget: "davefano.trackpad-plus"
-  manageIpc: true
+  moduleName: "nixfred.trackpad-pulse"
+  ipcTarget: "nixfred.trackpad-pulse"
+  manageIpc: false
 
   property string releaseVersion: ""
   FileView {
@@ -22,6 +34,7 @@ Panel {
     }
   }
 
+  // ---- settings state (Trackpad Plus) --------------------------------------
   // Each panel instance can select a device; the helper serializes writes across bars.
   property var devices: []
   property string selectedDevice: "apple"
@@ -145,63 +158,20 @@ Panel {
   property real pendingScrollFactor: 0.4
   property bool scrollSetQueued: false
 
-  // Carry sub-notch touchpad deltas between wheel events.
-  property real wheelAccumulator: 0
-
-  // ---- Cursor navigation ----
-  // Sections: "header" (enable/disable toggle), "scroll" (scroll speed slider),
-  // then toggle rows: "natural", "tap", "typing", "clickfinger"
+  // ---- Cursor navigation (controls page) ----
   property string focusSection: "header"
   property int selectedIndex: 0
   property bool cursorActive: false
 
-  readonly property var allSections: ["device", "device-settings", "header", "scroll"].concat(
+  readonly property var allSections: ["device", "header", "scroll"].concat(
     pointerFeel.profile === "mac" || pointerFeel.profile === "custom" ? [] : ["pointer"]
-  ).concat(["acceleration", "natural", "tap", "typing", "clickfinger"])
+  ).concat(["scale", "acceleration", "natural", "tap", "typing", "clickfinger"])
 
   readonly property string icon: {
     if (!deviceName) return ""
     return touchpadEnabled ? "󰟸" : "󰤳"
   }
 
-  // Agent-flavored phrases for the hero status line, rotated on a timer so the
-  // panel feels alive -- the same trick the built-in network, bluetooth, and
-  // power panels use. Two sets, picked by whether the pad is listening or not.
-  readonly property var enabledPhrases: [
-    "Tracking fingers",
-    "Counting taps",
-    "Reading swipes",
-    "Sensing capacitance",
-    "Herding pixels",
-    "Chasing gestures",
-    "Smoothing jitter",
-    "Polling deltas",
-    "Feeling around"
-  ]
-  readonly property var disabledPhrases: [
-    "Keyboardpunk",
-    "Palms rejected",
-    "Homerow purist",
-    "Hjkl forever",
-    "Sensor napping",
-    "Ignoring thumbs",
-    "Refusing swipes",
-    "Gone tactile"
-  ]
-  property int phraseIndex: 0
-
-  // Whichever list is "active" given the current touchpad state. Empty when
-  // there is no device, which is what parks the rotation on a static label.
-  readonly property var activePhrases: {
-    if (!deviceName) return []
-    return touchpadEnabled ? enabledPhrases : disabledPhrases
-  }
-  readonly property bool rotatingPhrases: false
-
-  // Guard on the list itself rather than on deviceName. Bindings settle in
-  // arbitrary order, so there is a tick where deviceName is already set but
-  // activePhrases has not re-evaluated yet -- phraseIndex % 0 is NaN there,
-  // and the lookup returns undefined, which QML refuses to assign to a string.
   readonly property string heroStatusText: deviceConnected
     ? (touchpadEnabled ? (hasSavedSettings ? "Settings saved separately" : "Ready to customize") : "Trackpad disabled")
     : "Disconnected · settings remembered"
@@ -234,11 +204,12 @@ Panel {
       adjustScrollFactor(delta > 0 ? 0.01 : -0.01)
     } else if (focusSection === "pointer") {
       adjustPointerSpeed(delta > 0 ? 0.1 : -0.1)
+    } else if (focusSection === "scale") {
+      setScrollScale(scrollScale + (delta > 0 ? 0.1 : -0.1))
     }
   }
 
   function activateCursor() {
-    if (focusSection === "device-settings") { toggleDeviceSettings(selectedDevice); return }
     if (focusSection === "acceleration") { openCurveEditor(); return }
     if (focusSection === "header") { toggleTouchpad(); return }
     if (focusSection === "natural") { toggleNaturalScroll(); return }
@@ -253,10 +224,6 @@ Panel {
   // through here, so a wedged hyprctl, a stuck omarchy-* tool or a helper
   // blocked on something unforeseen is reaped rather than accumulating one
   // orphan per click.
-  //
-  // timeout(1) without --foreground runs the command in its own process group
-  // and signals that group, so a shell's children die with it instead of being
-  // left behind; -k follows SIGTERM with SIGKILL for anything that ignores it.
   function bounded(seconds, argv) {
     return ["timeout", "-k", "2", String(seconds)].concat(argv)
   }
@@ -266,6 +233,12 @@ Panel {
     if (!deviceName) return
     touchpadEnabled = !touchpadEnabled
     enqueue("enabled", touchpadEnabled)
+  }
+
+  function setTouchpadEnabled(on) {
+    if (!deviceName || touchpadEnabled === on) return
+    touchpadEnabled = on
+    enqueue("enabled", on)
   }
 
   function toggleNaturalScroll() {
@@ -304,6 +277,7 @@ Panel {
     if (!touchpadEnabled) return
     selectDevice(selectedDevice) // Flush any pending speed edits first.
     editingCurve = true
+    active = "feel"
     curveEditor.begin()
   }
 
@@ -406,6 +380,173 @@ Panel {
     else refresh()
   }
 
+  // ---- telemetry (Trackpad Pulse) ---------------------------------------
+  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/trackpad-pulse"
+  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/trackpad-pulse"
+  readonly property string collector: decodeURIComponent(String(Qt.resolvedUrl("collectors/trackpad_pulse.py")).replace(/^file:\/\//, ""))
+  property var snap: ({})
+  property var live: ({})
+  property var histories: ({})
+  property real now: Date.now() / 1000
+  property string active: "overview"
+  property bool chooseMode: false
+  property int range: 3600
+  property string actionStatus: ""
+  onActionStatusChanged: if (actionStatus !== "") statusExpiry.restart()
+  Timer { id: statusExpiry; interval: 9000; onTriggered: root.actionStatus = "" }
+  readonly property var pages: [
+    { key: "overview", label: "Overview" },
+    { key: "controls", label: "Controls" },
+    { key: "feel", label: "Pointer feel" },
+    { key: "lab", label: "Touch lab" },
+    { key: "about", label: "About" }
+  ]
+  readonly property int pageIndex: {
+    for (var i = 0; i < root.pages.length; i++) if (root.pages[i].key === root.active) return i
+    return 0
+  }
+  readonly property bool stale: !snap.warm || now - Pulse.num(snap.ts) > 20
+  readonly property bool cursorOnly: !stale && snap.access === "cursor"
+  readonly property bool noAccess: !stale && (snap.access === "none" || snap.access === "cursor")
+  readonly property var today: snap.today || ({})
+  readonly property var todayCounts: today.counts || ({})
+  readonly property var week: snap.week || ({})
+  readonly property real binWidth: Pulse.num(snap.binMmS) || 5
+  readonly property real mmPerUnitMs: Pulse.num(snap.mmPerUnitMs) || 25.4
+  readonly property var todayHist: root.cursorOnly ? ((today.cursor || {}).hist || []) : (today.hist || [])
+  // The curve editor wants a distribution with some weight in it; a fresh day
+  // borrows the week until it has half a minute of movement of its own.
+  readonly property var feelHist: Pulse.total(todayHist) >= 30 || !week.hist ? todayHist : week.hist
+  readonly property var chart: histories[String(range)] || ({ points: [], seconds: range, now: now, bucket: 60, count: 0, peak: 0, busiest: 0, touches: 0, distance: 0 })
+  readonly property var pads: snap.pads || []
+  readonly property var readablePads: pads.filter(function(p) { return p.readable })
+  readonly property var livePads: live.pads || []
+  readonly property var liveFingers: {
+    var out = []
+    for (var i = 0; i < root.livePads.length; i++) out = out.concat(root.livePads[i].fingers || [])
+    return out
+  }
+  readonly property int fingersNow: liveFingers.length
+  readonly property bool palmNow: liveFingers.some(function(f) { return f.palm })
+  readonly property real speedNow: {
+    var s = 0
+    for (var i = 0; i < root.livePads.length; i++) s = Math.max(s, Pulse.num(root.livePads[i].speed))
+    if (root.cursorOnly && root.live.cursor) s = Pulse.num(root.live.cursor.speed) / 10
+    return s
+  }
+  readonly property real hzNow: {
+    var h = 0
+    for (var i = 0; i < root.livePads.length; i++) h = Math.max(h, Pulse.num(root.livePads[i].hz))
+    for (var j = 0; !h && j < root.pads.length; j++) h = Math.max(h, Pulse.num(root.pads[j].hz))
+    return h
+  }
+  readonly property real padAspect: readablePads.length && readablePads[0].height > 0 ? readablePads[0].width / readablePads[0].height : 1.6
+  readonly property real level: Pulse.clamp(speedNow / 200, 0, 1)
+  readonly property bool animated: root.setting("animated", true) !== false
+
+  readonly property color ink: Color.popups.text
+  readonly property color inkDim: Util.alpha(ink, 0.66)
+  readonly property color card: Util.alpha(ink, 0.05)
+  readonly property color cardEdge: Util.alpha(ink, 0.15)
+  readonly property color rule: Util.alpha(ink, 0.14)
+  readonly property color heat: Color.urgent
+  readonly property color tint: !deviceConnected || !touchpadEnabled || stale ? Color.muted
+    : palmNow ? Color.urgent : fingersNow > 0 ? Color.accent : Qt.darker(Color.accent, 1.15)
+  readonly property string verdict: Pulse.verdict(snap, live, touchpadEnabled, deviceConnected, now)
+
+  function setSetting(key, value) {
+    var next = {}
+    for (var k in root.settings) next[k] = root.settings[k]
+    next[key] = value
+    root.settings = next
+    var saved = root.bar && root.bar.shell
+      ? root.bar.shell.updateEntryInline(root.moduleName, root.settings) !== false
+      : false
+    if (!saved) root.actionStatus = "Changed for now, but it could not be saved to shell.json."
+    return saved
+  }
+  function showPage(key) {
+    for (var i = 0; i < root.pages.length; i++) if (root.pages[i].key === key) { root.chooseMode = false; root.active = key; return true }
+    root.actionStatus = "No such page: " + key
+    return false
+  }
+  function stepPage(delta) {
+    root.active = root.pages[Math.max(0, Math.min(root.pages.length - 1, root.pageIndex + delta))].key
+  }
+  function status() {
+    return JSON.stringify({ opened: root.opened, active: root.active, chooseMode: root.chooseMode, version: root.releaseVersion,
+      device: root.selectedDevice, deviceName: root.deviceName, connected: root.deviceConnected, enabled: root.touchpadEnabled,
+      scrollFactor: root.scrollFactor, scrollScale: root.scrollScale, pointerSpeed: root.pointerSpeed, profile: root.pointerFeel.profile,
+      access: root.snap.access || "offline", stale: root.stale, verdict: root.verdict, animated: root.animated,
+      fingers: root.fingersNow, speed: root.speedNow, hz: root.hzNow, today: root.todayCounts, peak: root.today.peak || 0,
+      samples: root.chart.count || 0, pads: root.pads.length, panelWidth: panel.contentWidth, panelHeight: panel.contentHeight,
+      contentNeeded: shell.implicitHeight, availableHeight: panel.availableCardHeight, availableWidth: panel.availableCardWidth,
+      action: root.actionStatus, error: root.settingsError })
+  }
+  // The recorder's actions return one JSON line each. Links never go through
+  // here: they are constants handed to xdg-open detached, after the panel
+  // closes, the way the other Pulse plugins learned to do it.
+  function runPulse(action) {
+    if (pulseProc.running) return
+    root.actionStatus = action === "grant-access" ? "Asking polkit for permission to install the udev rule…"
+      : action === "revoke-access" ? "Asking polkit to remove the udev rule…"
+      : action === "install-service" ? "Starting the recorder…" : "Working…"
+    pulseProc.command = root.bounded(130, ["python3", root.collector, action])
+    pulseProc.running = true
+  }
+  readonly property var links: ({ site: "https://nixfred.com", repo: "https://github.com/nixfred/trackpad.pulse", plugins: "https://omarchy.nixfred.com",
+    upstream: "https://github.com/davefano/omarchy-trackpad-plus", origin: "https://github.com/awkent01/omarchy-touchpad-widget" })
+  function openLink(name) {
+    var url = root.links[name]
+    if (!url) return
+    root.close()
+    Quickshell.execDetached(["xdg-open", url])
+  }
+
+  FileView {
+    id: snapshotFile; path: root.stateDir + "/snapshot.json"; watchChanges: true; printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { var m = JSON.parse(text()); if (m.warm) root.snap = m } catch (e) {} }
+  }
+  FileView {
+    id: liveFile; path: root.runtimeDir + "/live.json"; watchChanges: true; printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { root.live = JSON.parse(text()) } catch (e) {} }
+  }
+  FileView {
+    id: historyFile; path: root.stateDir + "/history.json"; watchChanges: true; printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { root.histories = JSON.parse(text()) } catch (e) {} }
+  }
+  Timer {
+    interval: 3000; running: true; repeat: true
+    onTriggered: { root.now = Date.now() / 1000; if (root.stale) { snapshotFile.reload(); historyFile.reload() } }
+  }
+  Process {
+    id: pulseProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try { var r = JSON.parse(text); root.actionStatus = r.error || r.message || "Done" }
+        catch (e) { root.actionStatus = "The recorder helper did not answer." }
+        snapshotFile.reload()
+      }
+    }
+    onExited: function(code, status) { if (code !== 0 && root.actionStatus.indexOf("…") >= 0) root.actionStatus = "That did not complete." }
+  }
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.chooseMode = false; root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.chooseMode = false; root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.chooseMode = false; root.toggle() }
+    function status(): string { return root.status() }
+    function page(name: string): void { if (root.showPage(String(name))) root.open() }
+    function chooser(): void { root.chooseMode = true; root.open() }
+    function enable(on: bool): void { root.setTouchpadEnabled(on) }
+  }
+
   // ---- Lifecycle ----
   visible: deviceName !== ""
   implicitWidth: button.implicitWidth
@@ -417,9 +558,16 @@ Panel {
     if (opened) {
       editingCurve = false
       refresh()
+      snapshotFile.reload()
+      historyFile.reload()
       focusSection = "device"
       cursorActive = false
+      if (!chooseMode && active === "feel") { editingCurve = true; curveEditor.begin() }
     }
+  }
+  onActiveChanged: {
+    if (active === "feel" && opened) { editingCurve = true; curveEditor.begin() }
+    else editingCurve = false
   }
 
   // Poll while open so external changes are reflected.
@@ -427,58 +575,6 @@ Panel {
     interval: 3000
     running: root.opened || root.devices.length === 0
     repeat: true
-    onTriggered: root.refresh()
-  }
-
-  // Rotate the hero phrase while the panel is open and a device is present.
-  // The swap is wrapped in a fade so the changeover reads as one motion
-  // rather than a hard cut.
-  Timer {
-    id: phraseTimer
-    interval: 2800
-    running: root.opened && root.rotatingPhrases
-    repeat: true
-    triggeredOnStart: false
-    onTriggered: phraseSwap.restart()
-  }
-
-  SequentialAnimation {
-    id: phraseSwap
-    PropertyAnimation {
-      target: heroStatus; property: "opacity"
-      to: 0.0; duration: 180; easing.type: Easing.OutQuad
-    }
-    ScriptAction {
-      script: {
-        var n = root.activePhrases.length
-        if (n > 0) root.phraseIndex = (root.phraseIndex + 1) % n
-      }
-    }
-    PropertyAnimation {
-      target: heroStatus; property: "opacity"
-      to: 1.0; duration: 260; easing.type: Easing.InQuad
-    }
-  }
-
-  // Toggling the pad swaps phrase sets, so restart the cycle from the top --
-  // otherwise index 4 of "enabled" carries over as index 4 of "disabled" and
-  // the label looks like it skipped. Leaving a rotating state entirely (device
-  // unplugged) halts a mid-flight fade so "NO DEVICE" is never stuck dimmed.
-  Connections {
-    target: root
-    function onActivePhrasesChanged() {
-      phraseSwap.stop()
-      heroStatus.opacity = 1.0
-      root.phraseIndex = 0
-    }
-  }
-
-  // Give omarchy-toggle-input-device and the reload time to land, then
-  // reconcile the panel against real state.
-  Timer {
-    id: enableSettle
-    interval: 600
-    repeat: false
     onTriggered: root.refresh()
   }
 
@@ -526,15 +622,240 @@ Panel {
     }
   }
 
-  // ---- Bar icon ----
-  BarIconButton {
+  // ---- Bar entry ----
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.icon
+    labelVisible: false
+    hasVisualContent: true
+    fixedWidth: vertical ? -1 : barRow.implicitWidth + 12
+    fixedHeight: vertical ? barRow.implicitHeight + 12 : -1
+    tooltipText: {
+      var lines = ["Trackpad Pulse" + (root.releaseVersion !== "" ? " v" + root.releaseVersion : "") + " · " + root.selectedLabel]
+      lines.push(root.verdict)
+      if (!root.stale) {
+        lines.push("Today: " + Pulse.readout(root.snap, root.live, 0) + " touches · " + Pulse.readout(root.snap, root.live, 2) + " taps · " + Pulse.int(root.todayCounts.clicks) + " clicks · " + Pulse.readout(root.snap, root.live, 1))
+        lines.push("Peak " + Pulse.readout(root.snap, root.live, 3) + " · active " + Pulse.readout(root.snap, root.live, 6) + " · " + Pulse.readout(root.snap, root.live, 7) + " palms rejected")
+      }
+      lines.push("Left-click: dashboard · Right-click: on/off")
+      return lines.join("\n")
+    }
     onPressed: function(b) {
-      if (b === Qt.RightButton) root.toggleTouchpad()
-      else root.toggle()
+      if (b === Qt.RightButton) { root.chooseMode = true; root.open() }
+      else { root.chooseMode = false; root.toggle() }
+    }
+    // The chip alone. It already says everything the bar needs: whether the
+    // pad is on, whether a finger is down and where, and how fast it moves.
+    Row {
+      id: barRow
+      anchors.centerIn: parent
+      TrackpadChip {
+        anchors.verticalCenter: parent.verticalCenter
+        compact: true
+        width: 34; height: 24
+        fingers: root.liveFingers
+        tint: root.tint
+        surface: Color.background
+        glint: root.bar ? root.bar.foreground : root.ink
+        padEnabled: root.touchpadEnabled && root.deviceConnected
+        animate: !root.stale && root.animated
+        level: root.level
+        aspect: root.padAspect
+      }
+    }
+  }
+
+  // ---- Shared components ----
+  component Label: Text {
+    color: root.inkDim
+    font.pixelSize: 12
+    textFormat: Text.PlainText
+  }
+  component Heading: Text {
+    color: root.ink
+    font.pixelSize: 15
+    font.bold: true
+    textFormat: Text.PlainText
+  }
+  component Action: Rectangle {
+    id: act
+    property string text: ""
+    property bool selected: false
+    property color accent: root.ink
+    signal clicked()
+    implicitWidth: caption.implicitWidth + 26
+    implicitHeight: 34
+    radius: 9
+    opacity: act.enabled ? 1 : 0.45
+    color: act.selected ? Qt.alpha(accent, Style.selectedFillAlpha) : area.containsMouse ? Style.hoverFill : Style.normalFill
+    border.color: act.selected ? accent : area.containsMouse ? Style.hoverBorderColor : Style.normalBorderColor
+    Behavior on color { ColorAnimation { duration: 120 } }
+    Text {
+      id: caption
+      anchors.centerIn: parent
+      text: act.text
+      color: act.selected ? root.ink : root.inkDim
+      font.pixelSize: 12
+      font.bold: act.selected
+      textFormat: Text.PlainText
+    }
+    MouseArea {
+      id: area
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: if (act.enabled) act.clicked()
+    }
+  }
+  component Stat: Rectangle {
+    id: stat
+    property string label: ""
+    property string value: ""
+    property string hint: ""
+    property color valueColor: root.ink
+    radius: 12
+    color: root.card
+    border.color: root.cardEdge
+    Column {
+      anchors.fill: parent
+      anchors.margins: 12
+      spacing: 5
+      Label { text: stat.label; font.pixelSize: 10; font.letterSpacing: 1 }
+      Heading { text: stat.value; font.pixelSize: 20; color: stat.valueColor; width: parent.width; elide: Text.ElideRight }
+      Label { text: stat.hint; font.pixelSize: 10; width: parent.width; elide: Text.ElideRight }
+    }
+  }
+  component Card: Rectangle {
+    radius: 14
+    color: root.card
+    border.color: root.cardEdge
+  }
+  component SettingRow: CursorSurface {
+    id: settingRow
+    required property string sectionName
+    foreground: root.bar ? root.bar.foreground : root.ink
+    fill: root.hoverFill
+    radius: 0
+    hasCursor: root.cursorActive && root.focusSection === sectionName
+    z: hasCursor ? 1 : 0
+    Rectangle {
+      anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+      height: 1; color: Qt.alpha(settingRow.foreground, 0.12); visible: !settingRow.hasCursor
+    }
+    Rectangle {
+      anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+      height: 1; color: Qt.alpha(settingRow.foreground, 0.12); visible: !settingRow.hasCursor
+    }
+    HoverHandler {
+      onHoveredChanged: if (hovered) {
+        root.cursorActive = true
+        root.focusSection = settingRow.sectionName
+      }
+    }
+  }
+  component ToggleRow: SettingRow {
+    id: toggleRow
+    required property string label
+    required property string description
+    required property bool checked
+    signal toggled()
+    hasCursor: root.cursorActive && root.focusSection === sectionName
+    foreground: root.bar ? root.bar.foreground : root.ink
+    fill: root.hoverFill
+    implicitHeight: Math.max(Style.space(58), rowContent.implicitHeight + Style.space(24))
+    opacity: root.touchpadEnabled ? 1.0 : 0.4
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) { root.cursorActive = true; root.focusSection = toggleRow.sectionName }
+      onClicked: if (toggleRow.enabled) toggleRow.toggled()
+    }
+    Item {
+      id: rowContent
+      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10); anchors.rightMargin: Style.space(10)
+      implicitHeight: Math.max(rowLabels.implicitHeight, rowSwitch.implicitHeight)
+      Column {
+        id: rowLabels
+        anchors.left: parent.left; anchors.right: rowSwitch.left; anchors.rightMargin: Style.space(12); anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+        Text { text: toggleRow.label; color: toggleRow.foreground; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: parent.width }
+        Text { visible: toggleRow.description !== ""; text: toggleRow.description; color: Qt.darker(toggleRow.foreground, 1.5); font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.caption; elide: Text.ElideRight; width: parent.width; wrapMode: Text.WordWrap }
+      }
+      ToggleSwitch {
+        id: rowSwitch
+        anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+        checked: toggleRow.checked
+        foreground: toggleRow.foreground
+        onToggled: if (toggleRow.enabled) toggleRow.toggled()
+      }
+    }
+  }
+  // A slider row with − / + ends, shared by scroll speed and pointer speed.
+  component SliderRow: SettingRow {
+    id: sliderRow
+    required property string label
+    required property string valueText
+    required property real minimum
+    required property real maximum
+    required property real step
+    required property real value
+    property bool dimmed: false
+    signal moved(real v)
+    signal released(real v)
+    signal nudged(real delta)
+    readonly property alias dragging: slider.dragging
+    readonly property alias liveValue: slider.liveValue
+    implicitHeight: content.implicitHeight + Style.space(26)
+    Column {
+      id: content
+      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10); anchors.rightMargin: Style.space(10)
+      spacing: Style.space(6)
+      opacity: sliderRow.dimmed ? 0.4 : 1
+      Item {
+        width: parent.width
+        implicitHeight: sliderLabel.implicitHeight
+        Text { id: sliderLabel; anchors.left: parent.left; text: sliderRow.label; color: sliderRow.foreground; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.body }
+        Text { anchors.right: parent.right; text: sliderRow.valueText; color: Qt.darker(sliderRow.foreground, 1.4); font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.caption }
+      }
+      Item {
+        width: parent.width
+        implicitHeight: Style.space(32)
+        CursorSurface {
+          id: minusSurface
+          anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(32); height: Style.space(32)
+          hasCursor: false; foreground: sliderRow.foreground; fill: root.hoverFill
+          Text { anchors.centerIn: parent; text: "−"; color: sliderRow.foreground; font.pixelSize: Style.font.heading; opacity: sliderRow.value <= sliderRow.minimum ? 0.3 : 1 }
+          MouseArea { anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: sliderRow.nudged(-sliderRow.step); onContainsMouseChanged: if (containsMouse) { root.cursorActive = true; root.focusSection = sliderRow.sectionName } }
+        }
+        CursorSurface {
+          anchors.left: minusSurface.right; anchors.right: plusSurface.left; anchors.leftMargin: Style.space(4); anchors.rightMargin: Style.space(4); anchors.verticalCenter: parent.verticalCenter
+          height: slider.implicitHeight + Style.spacing.controlGap
+          hasCursor: false; foreground: sliderRow.foreground; outline: true
+          PanelSlider {
+            id: slider
+            bar: root.bar
+            anchors.fill: parent; anchors.leftMargin: Style.space(6); anchors.rightMargin: Style.space(6)
+            minimum: sliderRow.minimum; maximum: sliderRow.maximum; step: sliderRow.step
+            value: sliderRow.value
+            onMoved: function(v) { sliderRow.moved(v) }
+            onReleased: function(v) { sliderRow.released(v) }
+          }
+          HoverHandler { onHoveredChanged: if (hovered) { root.cursorActive = true; root.focusSection = sliderRow.sectionName } }
+        }
+        CursorSurface {
+          id: plusSurface
+          anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(32); height: Style.space(32)
+          hasCursor: false; foreground: sliderRow.foreground; fill: root.hoverFill
+          Text { anchors.centerIn: parent; text: "+"; color: sliderRow.foreground; font.pixelSize: Style.font.heading; opacity: sliderRow.value >= sliderRow.maximum ? 0.3 : 1 }
+          MouseArea { anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: sliderRow.nudged(sliderRow.step); onContainsMouseChanged: if (containsMouse) { root.cursorActive = true; root.focusSection = sliderRow.sectionName } }
+        }
+      }
     }
   }
 
@@ -546,837 +867,818 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(root.editingCurve ? 430 : 340))
-    contentHeight: panel.fittedContentHeight(root.editingCurve ? curveColumn.implicitHeight : column.implicitHeight)
+    // Both dimensions are the content's real size; KeyboardPanel fits them to
+    // the screen itself. Nothing here scrolls: the pages are laid out wide so
+    // every control and every number is on screen at once.
+    contentWidth: panel.fittedContentWidth(root.chooseMode ? 620 : 1180)
+    contentHeight: panel.fittedContentHeight(shell.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.editingCurve
+      blocked: root.editingCurve && root.active === "feel" && !root.chooseMode
       onMoveRequested: function(dx, dy) {
+        if (root.chooseMode) return
+        if (root.active !== "controls") { if (dx !== 0) root.stepPage(dx); return }
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
         else if (dx !== 0) root.moveCursorH(dx)
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
+      onActivateRequested: if (root.cursorActive && root.active === "controls") root.activateCursor()
+      onCloseRequested: { if (root.chooseMode) root.chooseMode = false; else root.close() }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      ScrollView {
-        anchors.fill: parent
-        visible: root.editingCurve
-        clip: true
-        contentWidth: availableWidth
-        Column {
-          id: curveColumn
-          width: parent.width
-          spacing: Style.space(10)
-          Text {
-            visible: root.settingsError !== ""
-            width: parent.width
-            text: root.settingsError
-            color: Color.urgent
-            wrapMode: Text.Wrap
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-          CurveEditor {
-            id: curveEditor
-            width: parent.width
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            uiScale: Style.space(100) / 100
-            saved: root.pointerFeel
-            gainMaximum: root.scrollScale
-            deviceLabel: root.selectedLabel + " Trackpad"
-            busy: actionProc.running || root.pendingActions.length > 0
-            settingsError: root.settingsError
-            canRestore: !!root.previousFeels[root.selectedDevice]
-            onApplyRequested: function(value) { root.applyPointerFeel(value) }
-            onRestoreRequested: root.restorePointerFeel()
-            onBackRequested: { root.editingCurve = false; keyCatcher.forceActiveFocus() }
-          }
-        }
-      }
+      // The popup card can be translucent under some themes; the dashboard
+      // paints its own ground, as the other Pulse panels do, so a terminal
+      // behind it never shows through a graph.
+      Rectangle { anchors.fill: parent; anchors.margins: -10; radius: 14; color: Color.popups.background; z: -1 }
 
-      ScrollView {
-        anchors.fill: parent
-        visible: !root.editingCurve
-        clip: true
-        contentWidth: availableWidth
       Column {
-        id: column
+        id: shell
         width: parent.width
-        spacing: Style.space(14)
+        spacing: 14
 
+        // Header: name, blurb, and the verdict pill.
         Row {
           width: parent.width
-          spacing: Style.space(8)
-          Repeater {
-            model: root.devices
-            CursorSurface {
-              id: deviceButton
-              required property var modelData
-              width: (column.width - Style.space(8) * (root.devices.length - 1)) / Math.max(1, root.devices.length)
-              height: Style.space(38)
-              foreground: root.bar.foreground
-              fill: root.selectedDevice === modelData.id ? root.selectedFill : root.hoverFill
-              current: root.selectedDevice === modelData.id
-              hasCursor: root.cursorActive && root.focusSection === "device" && root.selectedDevice === modelData.id
-              Text {
-                anchors.centerIn: parent
-                width: parent.width - Style.space(76)
-                horizontalAlignment: Text.AlignHCenter
-                elide: Text.ElideRight
-                text: deviceButton.modelData.label
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.body
-                font.bold: root.selectedDevice === deviceButton.modelData.id
-              }
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: { root.selectDevice(parent.modelData.id); root.focusSection = "device" }
-              }
-              CursorSurface {
-                id: deviceGear
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(4)
+          spacing: 10
+          Column {
+            width: parent.width - 300
+            spacing: 3
+            Heading { text: "TRACKPAD PULSE"; font.pixelSize: 19; font.letterSpacing: 3 }
+            Label {
+              width: parent.width; elide: Text.ElideRight
+              text: (root.chooseMode ? "Switch the pad off, or open a page." : "Your trackpad, in motion.  ·  " + root.selectedLabel + (root.deviceName && root.deviceName !== root.selectedLabel ? "  ·  " + root.deviceName : ""))
+                + (root.releaseVersion !== "" ? "   ·   v" + root.releaseVersion : "")
+              font.pixelSize: 11
+            }
+          }
+          Rectangle {
+            width: 290; height: 32; radius: 16
+            color: Qt.alpha(root.tint, 0.14)
+            border.color: Qt.alpha(root.tint, 0.5)
+            Row {
+              anchors.centerIn: parent
+              spacing: 7
+              Rectangle {
+                width: 6; height: 6; radius: 3; color: root.tint
                 anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(30)
-                height: Style.space(30)
-                foreground: root.bar.foreground
-                hasCursor: root.cursorActive && root.focusSection === "device-settings" && root.selectedDevice === deviceButton.modelData.id
-                Accessible.role: Accessible.Button
-                Accessible.name: "Settings for " + deviceButton.modelData.label
+                SequentialAnimation on opacity {
+                  running: root.opened && !root.stale && root.animated
+                  loops: Animation.Infinite
+                  NumberAnimation { to: 0.3; duration: 900 }
+                  NumberAnimation { to: 1; duration: 900 }
+                }
+              }
+              Label { text: root.verdict; color: root.ink; font.pixelSize: 9; font.bold: true; elide: Text.ElideRight; width: Math.min(implicitWidth, 250) }
+            }
+          }
+        }
+
+        // Page switcher.
+        Row {
+          visible: !root.chooseMode
+          height: visible ? implicitHeight : 0
+          spacing: 8
+          Repeater {
+            model: root.pages
+            Action {
+              required property int index
+              required property var modelData
+              text: modelData.label
+              selected: root.active === modelData.key
+              accent: root.tint
+              onClicked: root.active = modelData.key
+            }
+          }
+          Item { width: 16; height: 1 }
+          Label {
+            visible: root.settingsError !== ""
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.settingsError; color: Color.urgent; font.pixelSize: 11
+            width: Math.min(implicitWidth, 420); elide: Text.ElideRight
+          }
+        }
+
+        // ================= OVERVIEW =================
+        Column {
+          width: parent.width
+          spacing: 14
+          visible: !root.chooseMode && root.active === "overview"
+          height: visible ? implicitHeight : 0
+
+          // Something is in the way of telemetry: say what, and offer the fix.
+          Rectangle {
+            width: parent.width
+            visible: root.stale || root.noAccess
+            height: visible ? 64 : 0
+            radius: 12
+            color: Util.alpha(Color.accent, 0.09)
+            border.color: Util.alpha(Color.accent, 0.38)
+            Row {
+              anchors.fill: parent; anchors.margins: 12; spacing: 14
+              Column {
+                width: parent.width - 260; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                Heading {
+                  font.pixelSize: 12
+                  text: root.stale ? "THE RECORDER IS NOT RUNNING" : root.cursorOnly ? "CURSOR ONLY: THE TOUCHPAD ITSELF IS CLOSED TO YOUR USER" : "NO ACCESS TO THE TOUCHPAD"
+                }
+                Label {
+                  width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+                  text: root.stale ? "Settings work without it. Start the user service to record touches, taps, gestures, speed and a week of history."
+                    : "Omarchy keeps users out of the input group so nothing can keylog. A udev rule can grant just the touchpad node to the logged-in seat, never the keyboard. One polkit prompt."
+                }
+              }
+              Action {
+                anchors.verticalCenter: parent.verticalCenter
+                accent: Color.accent; selected: true
+                text: root.stale ? "Start the recorder" : "Grant touchpad access"
+                enabled: !pulseProc.running
+                onClicked: root.runPulse(root.stale ? "install-service" : "grant-access")
+              }
+            }
+          }
+
+          // Hero: the pad itself, live, beside today's headline number.
+          Rectangle {
+            width: parent.width; height: 176; radius: 16
+            border.color: Qt.alpha(root.tint, 0.45)
+            gradient: Gradient { GradientStop { position: 0; color: Qt.alpha(root.tint, 0.13) } GradientStop { position: 1; color: root.card } }
+            TrackpadChip {
+              x: 14; y: 8; width: 236; height: 160
+              fingers: root.liveFingers; tint: root.tint; surface: Color.background; glint: root.ink
+              padEnabled: root.touchpadEnabled && root.deviceConnected
+              animate: root.opened && root.active === "overview" && !root.stale && root.animated
+              level: root.level; aspect: root.padAspect
+            }
+            Column {
+              x: 268; y: 22; spacing: 6
+              Label { text: root.cursorOnly ? "CURSOR TRAVEL TODAY" : "TOUCHES TODAY"; font.pixelSize: 11; font.letterSpacing: 2 }
+              Row {
+                spacing: 10
+                Text {
+                  text: root.stale ? "—" : root.cursorOnly ? Pulse.int((root.today.cursor || {}).distance) : Pulse.int(root.todayCounts.touches)
+                  color: root.ink; font.pixelSize: 52; font.weight: Font.Light; textFormat: Text.PlainText
+                }
+                Label { visible: root.cursorOnly; text: "px"; font.pixelSize: 18; anchors.bottom: parent.bottom; anchors.bottomMargin: 10 }
+              }
+              Label {
+                text: root.stale ? "Start the recorder to count them." : root.cursorOnly ? "No fingers, taps or gestures without pad access."
+                  : Pulse.int(root.todayCounts.moves) + " pointer moves  ·  " + Pulse.int(root.todayCounts.scrolls) + " scrolls  ·  " + Pulse.int(Pulse.num(root.todayCounts.taps) + Pulse.num(root.todayCounts.taps2) + Pulse.num(root.todayCounts.taps3)) + " taps  ·  " + Pulse.int(root.todayCounts.clicks) + " clicks"
+                color: root.inkDim
+              }
+              Label {
+                width: 560; elide: Text.ElideRight; font.pixelSize: 10
+                text: root.readablePads.length ? (root.readablePads[0].kernelName || root.readablePads[0].name) + "  ·  " + root.readablePads[0].width + " × " + root.readablePads[0].height + " mm  ·  " + root.readablePads[0].resX + " units/mm  ·  " + root.readablePads[0].slots + " fingers  ·  " + root.readablePads[0].bus
+                  : root.pads.length ? root.pads[0].name + "  ·  not readable" : root.deviceName
+              }
+            }
+            Column {
+              anchors.right: parent.right; anchors.rightMargin: 20; anchors.top: parent.top; anchors.topMargin: 20
+              spacing: 2
+              Text { anchors.right: parent.right; text: root.stale ? "—" : root.cursorOnly ? Pulse.pxSpeed(root.speedNow * 10) : Pulse.speed(root.speedNow); color: Qt.alpha(root.ink, 0.85); font.pixelSize: 22; font.weight: Font.Light; textFormat: Text.PlainText }
+              Label { anchors.right: parent.right; text: root.fingersNow > 0 ? root.fingersNow + (root.fingersNow === 1 ? " finger down" : " fingers down") : "now"; font.pixelSize: 10 }
+              Label { anchors.right: parent.right; text: root.hzNow > 0 ? Pulse.hz(root.hzNow) + " report rate" : ""; font.pixelSize: 10 }
+            }
+          }
+
+          Row {
+            width: parent.width; spacing: 10
+            Stat { width: (parent.width - 30) / 4; height: 96; label: root.cursorOnly ? "CURSOR TRAVEL" : "DISTANCE TODAY"
+              value: root.stale ? "—" : root.cursorOnly ? Pulse.int((root.today.cursor || {}).distance) + " px" : Pulse.distance(root.todayCounts.distance)
+              hint: root.cursorOnly ? "in logical pixels" : Pulse.distance(root.todayCounts.scroll) + " under two fingers  ·  " + Pulse.distance(root.week.distance) + " this week" }
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "TAPS · CLICKS"
+              value: root.stale || root.cursorOnly ? "—" : Pulse.int(Pulse.num(root.todayCounts.taps) + Pulse.num(root.todayCounts.taps2) + Pulse.num(root.todayCounts.taps3)) + " · " + Pulse.int(Pulse.num(root.todayCounts.clicks) + Pulse.num(root.todayCounts.rightClicks))
+              hint: Pulse.int(root.todayCounts.taps2) + " two-finger taps  ·  " + Pulse.int(root.todayCounts.rightClicks) + " right clicks" }
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "PEAK SPEED"
+              value: root.stale ? "—" : root.cursorOnly ? Pulse.pxSpeed((root.today.cursor || {}).peak) : Pulse.speed(root.today.peak)
+              hint: (root.today.peakAt ? "at " + Pulse.clock(root.today.peakAt) : "no movement yet") + "  ·  median " + (root.cursorOnly ? Pulse.pxSpeed(Pulse.percentile(root.todayHist, root.binWidth * 10, 0.5)) : Pulse.speed(Pulse.percentile(root.todayHist, root.binWidth, 0.5))) }
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "ACTIVE TIME"
+              value: root.stale ? "—" : Pulse.duration(root.cursorOnly ? (root.today.cursor || {}).active : root.todayCounts.active)
+              hint: root.cursorOnly ? "cursor in motion" : Pulse.duration(root.todayCounts.moving) + " moving  ·  " + Pulse.duration(root.week.active) + " this week" }
+          }
+
+          Row {
+            width: parent.width; spacing: 10
+            Card {
+              width: parent.width * 0.6 - 5; height: 236
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 8
+                Row {
+                  width: parent.width; spacing: 7
+                  Heading { text: "CONTINUOUS HISTORY"; font.pixelSize: 12; width: parent.width - 222; anchors.verticalCenter: parent.verticalCenter }
+                  Repeater {
+                    model: [{ t: "1 hour", s: 3600 }, { t: "24 hours", s: 86400 }, { t: "7 days", s: 604800 }]
+                    Action { required property var modelData; text: modelData.t; selected: root.range === modelData.s; accent: root.tint; implicitWidth: 68; implicitHeight: 28; onClicked: root.range = modelData.s }
+                  }
+                }
+                TouchHistoryGraph { width: parent.width; height: 146; historyData: root.chart; tint: root.tint; heat: root.heat; ink: root.ink; surface: Color.popups.background }
+                Row {
+                  spacing: 14
+                  Label { text: "▮ touches"; color: root.tint; font.pixelSize: 10 }
+                  Label { text: "━ peak mm/s"; color: root.heat; font.pixelSize: 10 }
+                  Label { text: Pulse.int(root.chart.touches) + " touches  ·  " + Pulse.distance(root.chart.distance) + "  ·  " + (root.chart.count || 0) + " minutes recorded"; font.pixelSize: 10 }
+                }
+                Label { font.pixelSize: 10; text: (root.chart.count || 0) < 2 ? "History is starting. One row per minute, seven-day retention." : "Recording while closed  ·  7-day retention  ·  hover to inspect" }
+              }
+            }
+            Card {
+              width: parent.width * 0.4 - 5; height: 236
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 8
+                Row {
+                  width: parent.width
+                  Heading { text: root.cursorOnly ? "CURSOR SPEED" : "WHERE YOUR FINGERS LIVE"; font.pixelSize: 12; width: parent.width - 60 }
+                  Label { text: "today"; font.pixelSize: 10; width: 60; horizontalAlignment: Text.AlignRight }
+                }
+                SpeedHistogram {
+                  width: parent.width; height: 146
+                  hist: root.todayHist; binWidth: root.binWidth; mmPerUnitMs: root.mmPerUnitMs; cursorUnits: root.cursorOnly
+                  curveStart: !root.cursorOnly && (root.pointerFeel.profile === "custom" || root.pointerFeel.profile === "mac") ? root.pointerFeel.curve.start : -1
+                  curveEnd: !root.cursorOnly && (root.pointerFeel.profile === "custom" || root.pointerFeel.profile === "mac") ? root.pointerFeel.curve.end : -1
+                  tint: root.tint; heat: root.heat; ink: root.ink; surface: Color.popups.background
+                }
+                Label {
+                  width: parent.width; font.pixelSize: 10; wrapMode: Text.WordWrap
+                  text: Pulse.total(root.todayHist) <= 0 ? "Move a finger and the distribution appears."
+                    : "Median " + (root.cursorOnly ? Pulse.pxSpeed(Pulse.percentile(root.todayHist, root.binWidth * 10, 0.5)) : Pulse.speed(Pulse.percentile(root.todayHist, root.binWidth, 0.5)))
+                      + "  ·  90% under " + (root.cursorOnly ? Pulse.pxSpeed(Pulse.percentile(root.todayHist, root.binWidth * 10, 0.9)) : Pulse.speed(Pulse.percentile(root.todayHist, root.binWidth, 0.9)))
+                      + (root.pointerFeel.profile === "custom" || root.pointerFeel.profile === "mac" ? "  ·  shaded: where your curve accelerates" : "")
+                }
+              }
+            }
+          }
+
+          Row {
+            width: parent.width; spacing: 10
+            Repeater {
+              model: [
+                { l: "POINTER MOVES", k: "moves" }, { l: "2-FINGER SCROLLS", k: "scrolls" }, { l: "PINCHES", k: "pinches" },
+                { l: "3-FINGER SWIPES", k: "swipes3" }, { l: "4-FINGER SWIPES", k: "swipes4" }, { l: "PALMS REJECTED", k: "palms" }
+              ]
+              Rectangle {
+                id: gestureCard
+                required property var modelData
+                width: (shell.width - 50) / 6; height: 62; radius: 12; color: root.card; border.color: gestureCard.modelData.k === "palms" && Pulse.num(root.todayCounts.palms) > 0 ? Qt.alpha(root.heat, 0.5) : root.cardEdge
+                Column {
+                  anchors.fill: parent; anchors.margins: 10; spacing: 3
+                  Label { text: gestureCard.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }
+                  Heading { text: root.stale || root.cursorOnly ? "—" : Pulse.int(root.todayCounts[gestureCard.modelData.k]); font.pixelSize: 18 }
+                }
+              }
+            }
+          }
+        }
+
+        // ================= CONTROLS =================
+        Column {
+          width: parent.width
+          spacing: 12
+          visible: !root.chooseMode && root.active === "controls"
+          height: visible ? implicitHeight : 0
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+            Repeater {
+              model: root.devices
+              CursorSurface {
+                id: deviceButton
+                required property var modelData
+                width: Math.min(380, (shell.width - Style.space(8) * (root.devices.length - 1)) / Math.max(1, root.devices.length))
+                height: Style.space(38)
+                foreground: root.bar ? root.bar.foreground : root.ink
+                fill: root.selectedDevice === modelData.id ? root.selectedFill : root.hoverFill
+                current: root.selectedDevice === modelData.id
+                hasCursor: root.cursorActive && root.focusSection === "device" && root.selectedDevice === modelData.id
                 Text {
                   anchors.centerIn: parent
-                  text: "⚙"
-                  color: root.bar.foreground
-                  font.pixelSize: Style.font.heading
+                  width: parent.width - Style.space(20)
+                  horizontalAlignment: Text.AlignHCenter
+                  elide: Text.ElideRight
+                  text: deviceButton.modelData.label + (deviceButton.modelData.connected ? "" : "  ·  away")
+                  color: deviceButton.foreground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.body
+                  font.bold: root.selectedDevice === deviceButton.modelData.id
+                  textFormat: Text.PlainText
                 }
                 MouseArea {
                   anchors.fill: parent
-                  hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onContainsMouseChanged: if (containsMouse) {
-                    root.cursorActive = true
-                    root.focusSection = "device-settings"
+                  onClicked: { root.selectDevice(deviceButton.modelData.id); root.focusSection = "device" }
+                }
+              }
+            }
+            Label { anchors.verticalCenter: parent.verticalCenter; text: root.devices.length > 1 ? "Each trackpad keeps its own settings." : ""; font.pixelSize: 10 }
+          }
+
+          Row {
+            width: parent.width
+            spacing: 24
+            // Left: the pad, the speeds and the scale.
+            Column {
+              id: settingsLeft
+              width: (parent.width - 24) / 2
+              spacing: -1
+              SettingRow {
+                sectionName: "header"
+                width: parent.width
+                implicitHeight: heroContent.implicitHeight + Style.space(24)
+                Item {
+                  id: heroContent
+                  anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10); anchors.rightMargin: Style.space(10)
+                  implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, powerSwitch.implicitHeight)
+                  Text { id: heroIcon; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: root.icon; color: root.bar ? root.bar.foreground : root.ink; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.display; opacity: root.touchpadEnabled ? 1 : 0.5 }
+                  ToggleSwitch {
+                    id: powerSwitch
+                    visible: root.deviceName !== ""
+                    checked: root.touchpadEnabled
+                    hasCursor: false
+                    foreground: root.bar ? root.bar.foreground : root.ink
+                    anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                    onHovered: function(on) { if (on) { root.cursorActive = true; root.focusSection = "header" } }
+                    onToggled: root.toggleTouchpad()
+                    PanelToolTip { visible: powerSwitch.containsMouse; text: root.touchpadEnabled ? "Disable touchpad" : "Enable touchpad"; fontFamily: root.bar ? root.bar.fontFamily : Style.font.family }
                   }
-                  onClicked: root.toggleDeviceSettings(deviceButton.modelData.id)
-                }
-                PanelToolTip {
-                  visible: deviceGear.hasCursor
-                  text: "Trackpad settings"
-                  fontFamily: root.bar.fontFamily
-                }
-              }
-            }
-          }
-        }
-
-        Text {
-          width: parent.width
-          visible: root.settingsError !== ""
-          text: root.settingsError
-          wrapMode: Text.Wrap
-          color: Color.urgent
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        Column {
-          width: parent.width
-          visible: root.deviceSettingsOpen
-          spacing: Style.space(8)
-          Item {
-            width: parent.width
-            implicitHeight: scaleSpinner.implicitHeight
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Device scale"
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-            }
-            SpinBox {
-              id: scaleSpinner
-              objectName: "scrollScaleSpinner"
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(10)
-              width: Style.space(110)
-              from: 10
-              to: 1000
-              stepSize: 10
-              value: Math.round(root.scrollScale * 100)
-              editable: true
-              live: false
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-              textFromValue: function(value, locale) { return (value / 100).toLocaleString(locale, 'f', 2) }
-              valueFromText: function(text, locale) { return Math.round(Number.fromLocaleString(locale, text) * 100) }
-              validator: DoubleValidator { bottom: 0.1; top: 10; decimals: 2; notation: DoubleValidator.StandardNotation; locale: scaleSpinner.locale.name }
-              onValueModified: root.setScrollScale(value / 100)
-              Accessible.name: "Device scale for " + root.selectedLabel
-              wheelEnabled: false
-              implicitHeight: Style.space(34)
-              leftPadding: Style.space(8)
-              rightPadding: Style.space(24)
-              function handleLargeStep(event) {
-                if (!(event.modifiers & Qt.ShiftModifier) || (event.key !== Qt.Key_Up && event.key !== Qt.Key_Down)) return
-                var current = scaleInput.acceptableInput ? valueFromText(scaleInput.text, locale) : value
-                root.setScrollScale(Math.max(from, Math.min(to, current + (event.key === Qt.Key_Up ? 1 : -1) * stepSize * 10)) / 100)
-                event.accepted = true
-              }
-              Keys.onPressed: function(event) { handleLargeStep(event) }
-              contentItem: TextInput {
-                id: scaleInput
-                objectName: "scrollScaleInput"
-                text: scaleSpinner.textFromValue(scaleSpinner.value, scaleSpinner.locale)
-                font: scaleSpinner.font
-                color: root.bar.foreground
-                selectionColor: Color.accent
-                selectedTextColor: Color.background
-                verticalAlignment: TextInput.AlignVCenter
-                selectByMouse: true
-                clip: true
-                validator: scaleSpinner.validator
-                inputMethodHints: Qt.ImhFormattedNumbersOnly
-                Keys.onPressed: function(event) { scaleSpinner.handleLargeStep(event) }
-              }
-              background: Rectangle {
-                color: Qt.alpha(root.bar.foreground, 0.04)
-                border.width: 1
-                border.color: scaleSpinner.activeFocus ? Color.accent : Qt.alpha(root.bar.foreground, 0.2)
-              }
-              up.indicator: Text {
-                x: scaleSpinner.width - width
-                y: 0
-                width: Style.space(22)
-                height: scaleSpinner.height / 2
-                text: "▴"
-                color: root.bar.foreground
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
-                opacity: scaleSpinner.up.pressed ? 1 : 0.65
-              }
-              down.indicator: Text {
-                x: scaleSpinner.width - width
-                y: scaleSpinner.height / 2
-                width: Style.space(22)
-                height: scaleSpinner.height / 2
-                text: "▾"
-                color: root.bar.foreground
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
-                opacity: scaleSpinner.down.pressed ? 1 : 0.65
-              }
-            }
-          }
-          Text {
-            width: parent.width - Style.space(20)
-            x: Style.space(10)
-            text: "Sets the scroll range and acceleration chart maximum. Use 1× for this trackpad or 3× for a wider range."
-            wrapMode: Text.WordWrap
-            color: Qt.darker(root.bar.foreground, 1.4)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-        }
-
-        Column {
-          id: settingsList
-          width: parent.width
-          spacing: -1 // Adjacent row borders share exactly the same pixel.
-          // ========== Hero: Touchpad icon + status + power toggle ==========
-          SettingRow {
-            sectionName: "header"
-            width: parent.width
-            implicitHeight: heroContent.implicitHeight + Style.space(28)
-            Item {
-              id: heroContent
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, powerSwitch.implicitHeight)
-
-              Text {
-                id: heroIcon
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.icon
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.display
-                opacity: root.touchpadEnabled ? 1.0 : 0.5
-              }
-
-              ToggleSwitch {
-                id: powerSwitch
-                visible: root.deviceName !== ""
-                checked: root.touchpadEnabled
-                hasCursor: false
-                foreground: root.bar.foreground
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                onHovered: function(on) {
-                  if (on) {
-                    root.cursorActive = true
-                    root.focusSection = "header"
+                  Column {
+                    id: heroLabels
+                    anchors.left: heroIcon.right; anchors.leftMargin: Style.space(14); anchors.right: parent.right; anchors.rightMargin: powerSwitch.visible ? powerSwitch.width + Style.space(12) : 0
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(2)
+                    Text { text: /touchpad|trackpad/i.test(root.selectedLabel) ? root.selectedLabel : root.selectedLabel + " trackpad"; color: root.bar ? root.bar.foreground : root.ink; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.title; font.bold: true; elide: Text.ElideRight; width: parent.width; textFormat: Text.PlainText }
+                    Text { text: root.heroStatusText.toUpperCase(); color: Qt.darker(root.bar ? root.bar.foreground : root.ink, 1.4); font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1.2; elide: Text.ElideRight; width: parent.width }
                   }
                 }
-                onToggled: root.toggleTouchpad()
-
-                PanelToolTip {
-                  visible: powerSwitch.containsMouse
-                  text: root.touchpadEnabled ? "Disable touchpad" : "Enable touchpad"
-                  fontFamily: root.bar.fontFamily
+              }
+              SliderRow {
+                id: scrollRow
+                sectionName: "scroll"
+                width: parent.width
+                label: "Scroll Speed"
+                valueText: {
+                  var v = scrollRow.dragging ? scrollRow.liveValue : root.scrollFactor
+                  return Model.scrollSpeedLabel(v) + "  " + v.toFixed(2) + (root.scrollScale === 1 ? "×" : " × " + root.scrollScale.toFixed(2))
+                }
+                minimum: 0.01; maximum: 1.0; step: 0.01
+                value: root.scrollFactor
+                dimmed: !root.touchpadEnabled
+                onMoved: function(v) { root.setScrollFactor(v) }
+                onReleased: function(v) { root.setScrollFactor(v); scrollDebounce.stop(); root.commitScrollFactor() }
+                onNudged: function(d) { root.adjustScrollFactor(d) }
+              }
+              SliderRow {
+                id: pointerRow
+                sectionName: "pointer"
+                width: parent.width
+                visible: root.pointerFeel.profile !== "mac" && root.pointerFeel.profile !== "custom"
+                height: visible ? implicitHeight : 0
+                label: "Pointer Speed"
+                valueText: {
+                  var v = pointerRow.dragging ? pointerRow.liveValue : root.pointerSpeed
+                  return Model.pointerSpeedLabel(v) + "  " + v.toFixed(1)
+                }
+                minimum: -1.0; maximum: 1.0; step: 0.1
+                value: root.pointerSpeed
+                dimmed: !root.touchpadEnabled
+                onMoved: function(v) { root.setPointerSpeed(v) }
+                onReleased: function(v) { root.setPointerSpeed(v); pointerDebounce.stop(); root.commitPointerSpeed() }
+                onNudged: function(d) { root.adjustPointerSpeed(d) }
+              }
+              SettingRow {
+                sectionName: "scale"
+                width: parent.width
+                implicitHeight: scaleContent.implicitHeight + Style.space(24)
+                Item {
+                  id: scaleContent
+                  anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10); anchors.rightMargin: Style.space(10)
+                  implicitHeight: Math.max(scaleLabels.implicitHeight, scaleSpinner.implicitHeight)
+                  Column {
+                    id: scaleLabels
+                    anchors.left: parent.left; anchors.right: scaleSpinner.left; anchors.rightMargin: Style.space(12); anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(1)
+                    Text { text: "Device scale"; color: root.bar ? root.bar.foreground : root.ink; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.body }
+                    Text { text: "Scroll range and curve ceiling · 1× for this pad, 3× for a wider range"; color: Qt.darker(root.bar ? root.bar.foreground : root.ink, 1.5); font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.caption; width: parent.width; elide: Text.ElideRight }
+                  }
+                  SpinBox {
+                    id: scaleSpinner
+                    objectName: "scrollScaleSpinner"
+                    anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(110)
+                    from: 10; to: 1000; stepSize: 10
+                    value: Math.round(root.scrollScale * 100)
+                    editable: true; live: false; wheelEnabled: false
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.body
+                    textFromValue: function(value, locale) { return (value / 100).toLocaleString(locale, 'f', 2) }
+                    valueFromText: function(text, locale) { return Math.round(Number.fromLocaleString(locale, text) * 100) }
+                    validator: DoubleValidator { bottom: 0.1; top: 10; decimals: 2; notation: DoubleValidator.StandardNotation; locale: scaleSpinner.locale.name }
+                    onValueModified: root.setScrollScale(value / 100)
+                    Accessible.name: "Device scale for " + root.selectedLabel
+                    implicitHeight: Style.space(34)
+                    leftPadding: Style.space(8); rightPadding: Style.space(24)
+                    function handleLargeStep(event) {
+                      if (!(event.modifiers & Qt.ShiftModifier) || (event.key !== Qt.Key_Up && event.key !== Qt.Key_Down)) return
+                      var current = scaleInput.acceptableInput ? valueFromText(scaleInput.text, locale) : value
+                      root.setScrollScale(Math.max(from, Math.min(to, current + (event.key === Qt.Key_Up ? 1 : -1) * stepSize * 10)) / 100)
+                      event.accepted = true
+                    }
+                    Keys.onPressed: function(event) { handleLargeStep(event) }
+                    contentItem: TextInput {
+                      id: scaleInput
+                      objectName: "scrollScaleInput"
+                      text: scaleSpinner.textFromValue(scaleSpinner.value, scaleSpinner.locale)
+                      font: scaleSpinner.font
+                      color: root.bar ? root.bar.foreground : root.ink
+                      selectionColor: Color.accent
+                      selectedTextColor: Color.background
+                      verticalAlignment: TextInput.AlignVCenter
+                      selectByMouse: true; clip: true
+                      validator: scaleSpinner.validator
+                      inputMethodHints: Qt.ImhFormattedNumbersOnly
+                      Keys.onPressed: function(event) { scaleSpinner.handleLargeStep(event) }
+                    }
+                    background: Rectangle {
+                      color: Qt.alpha(root.bar ? root.bar.foreground : root.ink, 0.04)
+                      border.width: 1
+                      border.color: scaleSpinner.activeFocus ? Color.accent : Qt.alpha(root.bar ? root.bar.foreground : root.ink, 0.2)
+                    }
+                    up.indicator: Text { x: scaleSpinner.width - width; y: 0; width: Style.space(22); height: scaleSpinner.height / 2; text: "▴"; color: root.bar ? root.bar.foreground : root.ink; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; opacity: scaleSpinner.up.pressed ? 1 : 0.65 }
+                    down.indicator: Text { x: scaleSpinner.width - width; y: scaleSpinner.height / 2; width: Style.space(22); height: scaleSpinner.height / 2; text: "▾"; color: root.bar ? root.bar.foreground : root.ink; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; opacity: scaleSpinner.down.pressed ? 1 : 0.65 }
+                  }
                 }
               }
+            }
+            // Right: the toggles and the way into the curve editor.
+            Column {
+              width: (parent.width - 24) / 2
+              spacing: -1
+              SettingRow {
+                sectionName: "acceleration"
+                width: parent.width
+                height: Style.space(58)
+                foreground: root.bar ? root.bar.foreground : root.ink
+                fill: root.hoverFill
+                opacity: root.touchpadEnabled ? 1 : 0.4
+                enabled: root.touchpadEnabled
+                Column {
+                  anchors.left: parent.left; anchors.leftMargin: Style.space(10); anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(3)
+                  Text { text: "Pointer feel  ›"; color: root.bar ? root.bar.foreground : root.ink; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.body }
+                  Text { text: ({ adaptive: "System", flat: "Flat", mac: "Mac-inspired", custom: "Custom" })[root.pointerFeel.profile] + " · Presets and acceleration curve, with your finger-speed map under it"; color: Qt.darker(root.bar ? root.bar.foreground : root.ink, 1.4); font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.caption }
+                }
+                MouseArea {
+                  anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                  onContainsMouseChanged: if (containsMouse) { root.cursorActive = true; root.focusSection = "acceleration" }
+                  onClicked: root.openCurveEditor()
+                }
+              }
+              ToggleRow { width: parent.width; label: "Natural Scrolling"; description: "Scroll content in the direction of finger movement"; checked: root.naturalScroll; sectionName: "natural"; enabled: root.touchpadEnabled; onToggled: root.toggleNaturalScroll() }
+              ToggleRow { width: parent.width; label: "Tap to Click"; description: "Tap the touchpad to click"; checked: root.tapToClick; sectionName: "tap"; enabled: root.touchpadEnabled; onToggled: root.toggleTapToClick() }
+              ToggleRow { width: parent.width; label: "Disable While Typing"; description: "Ignore touchpad input while typing"; checked: root.disableWhileTyping; sectionName: "typing"; enabled: root.touchpadEnabled; onToggled: root.toggleDisableWhileTyping() }
+              ToggleRow { width: parent.width; label: "Two-Finger Right Click"; description: "Press with two fingers to right-click"; checked: root.clickfingerBehavior; sectionName: "clickfinger"; enabled: root.touchpadEnabled; onToggled: root.toggleClickfingerBehavior() }
+            }
+          }
+          Label {
+            width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+            text: "Sliders and switches save as you use them, per device, through Trackpad Plus's journalled backend. The first edit of a new device applies every value shown. ↑↓ moves between rows, ←→ adjusts, Enter toggles."
+          }
+        }
 
+        // ================= POINTER FEEL =================
+        Row {
+          width: parent.width
+          spacing: 20
+          visible: !root.chooseMode && root.active === "feel"
+          height: visible ? implicitHeight : 0
+          Column {
+            width: 600
+            spacing: Style.space(10)
+            CurveEditor {
+              id: curveEditor
+              width: parent.width
+              foreground: root.bar ? root.bar.foreground : root.ink
+              accent: Color.accent
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+              uiScale: Style.space(100) / 100
+              saved: root.pointerFeel
+              gainMaximum: root.scrollScale
+              deviceLabel: /touchpad|trackpad/i.test(root.selectedLabel) ? root.selectedLabel : root.selectedLabel + " Trackpad"
+              busy: actionProc.running || root.pendingActions.length > 0
+              settingsError: root.settingsError
+              canRestore: !!root.previousFeels[root.selectedDevice]
+              speedHistogram: root.cursorOnly ? [] : root.feelHist
+              histogramBinUnits: root.binWidth / root.mmPerUnitMs
+              histogramColor: root.tint
+              onApplyRequested: function(value) { root.applyPointerFeel(value) }
+              onRestoreRequested: root.restorePointerFeel()
+              onBackRequested: { root.active = "controls"; keyCatcher.forceActiveFocus() }
+            }
+          }
+          Column {
+            width: parent.width - 620
+            spacing: 12
+            Card {
+              width: parent.width; height: 250
               Column {
-                id: heroLabels
-                anchors.left: heroIcon.right
-                anchors.leftMargin: Style.space(14)
-                anchors.right: parent.right
-                anchors.rightMargin: powerSwitch.visible ? powerSwitch.width + Style.space(12) : 0
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(2)
-
-                Text {
-                  text: "Trackpad Plus"
-                  color: root.bar.foreground
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.title
-                  font.bold: true
-                  elide: Text.ElideRight
+                anchors.fill: parent; anchors.margins: 14; spacing: 8
+                Row {
                   width: parent.width
+                  Heading { text: "WHERE YOUR FINGERS LIVE"; font.pixelSize: 12; width: parent.width - 90 }
+                  Label { text: root.feelHist === root.todayHist ? "today" : "this week"; font.pixelSize: 10; width: 90; horizontalAlignment: Text.AlignRight }
                 }
+                SpeedHistogram {
+                  width: parent.width; height: 160
+                  hist: root.cursorOnly ? [] : root.feelHist; binWidth: root.binWidth; mmPerUnitMs: root.mmPerUnitMs
+                  curveStart: curveEditor.custom ? curveEditor.draft.curve.start : -1
+                  curveEnd: curveEditor.custom ? curveEditor.draft.curve.end : -1
+                  tint: root.tint; heat: root.heat; ink: root.ink; surface: Color.popups.background
+                }
+                Label { width: parent.width; font.pixelSize: 10; wrapMode: Text.WordWrap; text: "Bars: seconds of finger movement per 5 mm/s. Solid line: median. Dotted: 90th percentile. Shaded: the draft curve's acceleration band. Dashed: the right edge of the graph on the left." }
+              }
+            }
+            Card {
+              width: parent.width; height: readingColumn.implicitHeight + 28
+              Column {
+                id: readingColumn
+                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
+                spacing: 8
+                Heading { text: "WHAT THE DATA SAYS"; font.pixelSize: 12 }
+                Label {
+                  width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11; color: root.ink
+                  text: {
+                    if (root.cursorOnly) return "Without access to the pad there is no finger speed to compare the curve against. Grant it from the Touch lab."
+                    var h = root.feelHist
+                    if (Pulse.total(h) < 5) return "Fewer than five seconds of movement recorded. Use the pad for a while and come back; the curve will have something to be judged against."
+                    var med = Pulse.percentile(h, root.binWidth, 0.5), p90 = Pulse.percentile(h, root.binWidth, 0.9)
+                    var lines = ["Half of your movement is slower than " + Pulse.speed(med) + ", which is " + Math.round(Pulse.mmToCurve(med, root.mmPerUnitMs) / 4 * 100) + "% of the way across the graph. Nine tenths is under " + Pulse.speed(p90) + "."]
+                    if (curveEditor.custom) {
+                      var s = Pulse.curveToMm(curveEditor.draft.curve.start, root.mmPerUnitMs), e = Pulse.curveToMm(curveEditor.draft.curve.end, root.mmPerUnitMs)
+                      var below = Pulse.shareBelow(h, root.binWidth, s), inside = Pulse.shareBelow(h, root.binWidth, e) - below
+                      lines.push("This draft holds precision gain up to " + Pulse.speed(s) + " and reaches full gain at " + Pulse.speed(e) + ": " + Math.round(below * 100) + "% of your movement stays in the precision zone, " + Math.round(inside * 100) + "% rides the transition, " + Math.round((1 - below - inside) * 100) + "% is already at full gain.")
+                      if (below > 0.85) lines.push("Nearly everything you do is below Start. Either that is the point, or Start could come left.")
+                      if (below + inside < 0.3) lines.push("Most of your movement is past End: the curve is mostly acting as a flat multiplier. Push End right to spread the transition over speeds you actually use.")
+                    } else {
+                      lines.push("Choose Custom or Mac-inspired to place the acceleration band against this distribution.")
+                    }
+                    var beyond = 1 - Pulse.shareBelow(h, root.binWidth, Pulse.curveToMm(4, root.mmPerUnitMs))
+                    if (beyond > 0.15) lines.push(Math.round(beyond * 100) + "% of your movement is faster than the graph's right edge; libinput holds the fast-swipe gain out there.")
+                    return lines.join("  ")
+                  }
+                }
+              }
+            }
+          }
+        }
 
-                Text {
-                  id: heroStatus
-                  text: root.heroStatusText.toUpperCase()
-                  color: Qt.darker(root.bar.foreground, 1.4)
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                  font.letterSpacing: 1.2
-                  elide: Text.ElideRight
+        // ================= TOUCH LAB =================
+        Column {
+          width: parent.width
+          spacing: 12
+          visible: !root.chooseMode && root.active === "lab"
+          height: visible ? implicitHeight : 0
+          Row {
+            width: parent.width; spacing: 10
+            Card {
+              width: parent.width * 0.5 - 5; height: 214
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 6
+                Row {
                   width: parent.width
+                  Heading { text: "EVERY FINGER"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: root.fingersNow > 0 ? root.fingersNow + " on the pad" : root.stale ? "recorder offline" : root.cursorOnly ? "no pad access" : "nothing touching"; width: parent.width / 2; horizontalAlignment: Text.AlignRight; color: Color.accent }
+                }
+                Row {
+                  width: parent.width
+                  Label { text: "SLOT"; font.pixelSize: 9; width: parent.width * 0.12 }
+                  Label { text: "X mm"; font.pixelSize: 9; width: parent.width * 0.18 }
+                  Label { text: "Y mm"; font.pixelSize: 9; width: parent.width * 0.18 }
+                  Label { text: "SPEED"; font.pixelSize: 9; width: parent.width * 0.22 }
+                  Label { text: "PRESSURE"; font.pixelSize: 9; width: parent.width * 0.16 }
+                  Label { text: "TOOL"; font.pixelSize: 9; width: parent.width * 0.14 }
+                }
+                Repeater {
+                  model: 5
+                  Row {
+                    id: fingerRow
+                    required property int index
+                    readonly property var f: root.active === "lab" && index < root.liveFingers.length ? root.liveFingers[index] : null
+                    readonly property var pad: root.readablePads.length ? root.readablePads[0] : null
+                    width: parent.width; height: 24
+                    opacity: f ? 1 : 0.3
+                    Label { text: fingerRow.f ? String(fingerRow.f.slot) : String(fingerRow.index); width: parent.width * 0.12; color: root.ink; anchors.verticalCenter: parent.verticalCenter }
+                    Label { text: fingerRow.f && fingerRow.pad ? (fingerRow.f.x * fingerRow.pad.width).toFixed(1) : "—"; width: parent.width * 0.18; anchors.verticalCenter: parent.verticalCenter }
+                    Label { text: fingerRow.f && fingerRow.pad ? (fingerRow.f.y * fingerRow.pad.height).toFixed(1) : "—"; width: parent.width * 0.18; anchors.verticalCenter: parent.verticalCenter }
+                    Item {
+                      width: parent.width * 0.22; height: parent.height
+                      Rectangle { anchors.verticalCenter: parent.verticalCenter; width: parent.width - 8; height: 5; radius: 3; color: Util.alpha(root.ink, 0.13)
+                        Rectangle { width: parent.width * Pulse.clamp((fingerRow.f ? fingerRow.f.speed : 0) / 300, 0, 1); height: parent.height; radius: 3; color: root.tint } }
+                    }
+                    Label { text: fingerRow.f ? (fingerRow.f.p === null || fingerRow.f.p === undefined ? "n/a" : Pulse.pct(fingerRow.f.p)) : "—"; width: parent.width * 0.16; anchors.verticalCenter: parent.verticalCenter }
+                    Label { text: fingerRow.f ? (fingerRow.f.palm ? "palm" : "finger") : "—"; width: parent.width * 0.14; color: fingerRow.f && fingerRow.f.palm ? root.heat : root.inkDim; anchors.verticalCenter: parent.verticalCenter }
+                  }
                 }
               }
             }
-          }
-
-          // ========== Scroll speed slider ==========
-          SettingRow {
-            sectionName: "scroll"
-            width: parent.width
-            implicitHeight: scrollContent.implicitHeight + Style.space(28)
-            Column {
-              id: scrollContent
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(8)
-              opacity: root.touchpadEnabled ? 1.0 : 0.4
-
-              Item {
-                width: parent.width
-                implicitHeight: scrollLabel.implicitHeight
-
-                Text {
-                  id: scrollLabel
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "Scroll Speed"
-                  color: root.bar.foreground
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.body
+            Card {
+              width: parent.width * 0.5 - 5; height: 214
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 8
+                Heading { text: "THE PAD"; font.pixelSize: 12 }
+                Grid {
+                  width: parent.width; columns: 3; columnSpacing: 10; rowSpacing: 8
+                  Repeater {
+                    model: {
+                      var p = root.readablePads.length ? root.readablePads[0] : (root.pads.length ? root.pads[0] : null)
+                      if (!p) return [{ l: "DEVICE", v: root.deviceName || "—", h: "as Hyprland names it" }]
+                      return [
+                        { l: "SIZE", v: p.width ? p.width + " × " + p.height + " mm" : "—", h: p.unitsX ? p.unitsX + " × " + p.unitsY + " units" : "" },
+                        { l: "RESOLUTION", v: p.resX ? p.resX + " units/mm" : "—", h: p.resX ? (25.4 * p.resX).toFixed(0) + " dpi" : "" },
+                        { l: "FINGERS", v: p.slots ? p.slots + " slots" : "—", h: p.multitouch ? "multitouch" : "single touch" },
+                        { l: "REPORT RATE", v: Pulse.hz(p.hz), h: "frames per second while touched" },
+                        { l: "PRESSURE", v: p.pressure ? "yes" : "no", h: p.major ? "touch size reported" : "no touch size" },
+                        { l: "BUS", v: (p.bus || "—") + (p.vendor ? "  " + p.vendor + ":" + p.product : ""), h: p.node || "" }
+                      ]
+                    }
+                    Column {
+                      id: padFact
+                      required property var modelData
+                      width: (shell.width * 0.5 - 5 - 28 - 20) / 3
+                      spacing: 2
+                      Label { text: padFact.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }
+                      Heading { text: padFact.modelData.v; font.pixelSize: 14; width: parent.width; elide: Text.ElideRight }
+                      Label { text: padFact.modelData.h; font.pixelSize: 9; width: parent.width; elide: Text.ElideRight }
+                    }
+                  }
                 }
-
-                Text {
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
+                Label { width: parent.width; font.pixelSize: 10; elide: Text.ElideRight; text: root.readablePads.length ? (root.readablePads[0].kernelName || root.readablePads[0].name) + "  ·  " + root.readablePads[0].phys : "" }
+              }
+            }
+          }
+          Row {
+            width: parent.width; spacing: 10
+            Rectangle {
+              width: parent.width * 0.5 - 5; height: 150; radius: 12
+              color: Util.alpha(Color.accent, 0.09); border.color: Util.alpha(Color.accent, 0.38)
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 8
+                Heading { text: "ACCESS"; font.pixelSize: 12 }
+                Label {
+                  width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11; color: root.inkDim
                   text: {
-                    var v = scrollSlider.dragging ? scrollSlider.liveValue : root.scrollFactor
-                    return Model.scrollSpeedLabel(v) + "  " + v.toFixed(2) + (root.scrollScale === 1 ? "×" : " × " + root.scrollScale.toFixed(2))
-                  }
-                  color: Qt.darker(root.bar.foreground, 1.4)
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              Item {
-                width: parent.width
-                implicitHeight: Math.max(minusBtn.implicitHeight, scrollRow.implicitHeight, plusBtn.implicitHeight)
-
-                // Minus button
-                CursorSurface {
-                  id: minusSurface
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(32)
-                  height: Style.space(32)
-                  hasCursor: false
-                  foreground: root.bar.foreground
-                  fill: root.hoverFill
-
-                  Text {
-                    id: minusBtn
-                    anchors.centerIn: parent
-                    text: "−"
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.heading
-                    opacity: root.scrollFactor <= 0.01 ? 0.3 : 1.0
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.adjustScrollFactor(-0.01)
-                    onContainsMouseChanged: if (containsMouse) {
-                      root.cursorActive = true
-                      root.focusSection = "scroll"
-                    }
+                    if (root.stale) return "The recorder is not running, so nothing is being read. Start it and it will report which of these it has."
+                    var parts = ["Recorder: " + Pulse.accessLabel(root.snap) + "."]
+                    parts.push("input group: " + (root.snap.inputGroup ? "yes (Omarchy normally removes it)" : "no") + ".")
+                    parts.push("udev rule: " + (root.snap.udevRule ? "installed" : "not installed") + ".")
+                    if (root.snap.access === "evdev") parts.push("Fingers, taps and gestures are being read from the pad's own event node.")
+                    else parts.push("A udev rule can grant the logged-in seat read access to touchpad nodes only. It takes one polkit prompt and is removable here.")
+                    return parts.join("  ")
                   }
                 }
-
-                // Slider track
-                CursorSurface {
-                  id: scrollRow
-                  anchors.left: minusSurface.right
-                  anchors.right: plusSurface.left
-                  anchors.leftMargin: Style.space(4)
-                  anchors.rightMargin: Style.space(4)
-                  anchors.verticalCenter: parent.verticalCenter
-                  height: scrollSlider.implicitHeight + Style.spacing.controlGap
-                  hasCursor: false
-                  foreground: root.bar.foreground
-                  outline: true
-
-                  PanelSlider {
-                    id: scrollSlider
-                    bar: root.bar
-                    anchors.fill: parent
-                    anchors.leftMargin: Style.space(6)
-                    anchors.rightMargin: Style.space(6)
-                    minimum: 0.01
-                    maximum: 1.0
-                    step: 0.01
-                    value: root.scrollFactor
-                    onMoved: function(v) { root.setScrollFactor(v) }
-                    onReleased: function(v) {
-                      root.setScrollFactor(v)
-                      scrollDebounce.stop()
-                      root.commitScrollFactor()
-                    }
-                  }
-
-                  HoverHandler {
-                    onHoveredChanged: if (hovered) {
-                      root.cursorActive = true
-                      root.focusSection = "scroll"
-                    }
-                  }
-                }
-
-                // Plus button
-                CursorSurface {
-                  id: plusSurface
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(32)
-                  height: Style.space(32)
-                  hasCursor: false
-                  foreground: root.bar.foreground
-                  fill: root.hoverFill
-
-                  Text {
-                    id: plusBtn
-                    anchors.centerIn: parent
-                    text: "+"
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.heading
-                    opacity: root.scrollFactor >= 1.0 ? 0.3 : 1.0
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.adjustScrollFactor(0.01)
-                    onContainsMouseChanged: if (containsMouse) {
-                      root.cursorActive = true
-                      root.focusSection = "scroll"
-                    }
-                  }
+                Row {
+                  spacing: 8
+                  Action { text: root.stale ? "Start the recorder" : "Restart the recorder"; accent: Color.accent; enabled: !pulseProc.running; onClicked: root.runPulse("install-service") }
+                  Action { visible: !root.stale; text: root.snap.udevRule ? "Remove the udev rule" : "Grant touchpad access"; accent: Color.accent; selected: !root.snap.udevRule && root.noAccess; enabled: !pulseProc.running; onClicked: root.runPulse(root.snap.udevRule ? "revoke-access" : "grant-access") }
+                  Action { visible: !root.stale; text: "Stop the recorder"; enabled: !pulseProc.running; onClicked: root.runPulse("uninstall-service") }
                 }
               }
             }
+            Card {
+              width: parent.width * 0.5 - 5; height: 150
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 6
+                Heading { text: "THIS WEEK"; font.pixelSize: 12 }
+                Grid {
+                  width: parent.width; columns: 4; columnSpacing: 10; rowSpacing: 6
+                  Repeater {
+                    model: [
+                      { l: "TOUCHES", v: Pulse.int(root.week.touches) }, { l: "TAPS", v: Pulse.int(root.week.taps) }, { l: "CLICKS", v: Pulse.int(root.week.clicks) }, { l: "GESTURES", v: Pulse.int(root.week.swipes) },
+                      { l: "DISTANCE", v: Pulse.distance(root.week.distance) }, { l: "SCROLLED", v: Pulse.distance(root.week.scroll) }, { l: "ACTIVE", v: Pulse.duration(root.week.active) }, { l: "PALMS", v: Pulse.int(root.week.palms) }
+                    ]
+                    Column {
+                      id: weekFact
+                      required property var modelData
+                      width: (shell.width * 0.5 - 5 - 28 - 30) / 4
+                      spacing: 1
+                      Label { text: weekFact.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }
+                      Heading { text: root.stale ? "—" : weekFact.modelData.v; font.pixelSize: 14; width: parent.width; elide: Text.ElideRight }
+                    }
+                  }
+                }
+                Label { width: parent.width; font.pixelSize: 10; elide: Text.ElideRight; text: (root.week.minutes || 0) + " minutes recorded  ·  peak " + Pulse.speed(root.week.peak) + "  ·  " + root.stateDir }
+              }
+            }
           }
+          Label {
+            width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+            text: "Settings: " + (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/omarchy/local-touchpads/settings.json and the generated toggles/hypr/zz-local-touchpads.lua, both Trackpad Plus's.  Live fingers: " + root.runtimeDir + "/live.json on tmpfs, written only while something touches the pad."
+          }
+        }
 
-          // ========== Pointer speed slider ==========
-          // Range is Hyprland's [-1.0, 1.0], centered on 0.0 rather than running
-          // low-to-high like the scroll slider above it.
-          SettingRow {
-            sectionName: "pointer"
-            width: parent.width
-            visible: root.pointerFeel.profile !== "mac" && root.pointerFeel.profile !== "custom"
-            implicitHeight: pointerContent.implicitHeight + Style.space(28)
+        // ================= ABOUT =================
+        Column {
+          width: parent.width
+          spacing: 12
+          visible: !root.chooseMode && root.active === "about"
+          height: visible ? implicitHeight : 0
+          Rectangle {
+            width: parent.width; height: 132; radius: 16; border.color: Qt.alpha(root.tint, 0.45)
+            gradient: Gradient { GradientStop { position: 0; color: Qt.alpha(root.tint, 0.13) } GradientStop { position: 1; color: root.card } }
+            TrackpadChip { x: 14; y: 6; width: 180; height: 120; fingers: root.liveFingers; tint: root.tint; surface: Color.background; glint: root.ink; padEnabled: true; animate: root.opened && root.active === "about" && root.animated; level: root.level; aspect: root.padAspect }
             Column {
-              id: pointerContent
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(8)
-              opacity: root.touchpadEnabled ? 1.0 : 0.4
-
-              Item {
-                width: parent.width
-                implicitHeight: pointerLabel.implicitHeight
-
-                Text {
-                  id: pointerLabel
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "Pointer Speed"
-                  color: root.bar.foreground
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.body
+              x: 210; y: 22; spacing: 6
+              Heading { text: "TRACKPAD PULSE"; font.pixelSize: 22; font.letterSpacing: 3 }
+              Label { text: "Your trackpad, in motion."; font.pixelSize: 11 }
+              Row {
+                spacing: 8
+                Rectangle {
+                  height: 24; width: versionText.implicitWidth + 18; radius: 12
+                  color: Qt.alpha(root.tint, 0.16); border.color: Qt.alpha(root.tint, 0.5)
+                  Text { id: versionText; anchors.centerIn: parent; text: root.releaseVersion ? "v" + root.releaseVersion : "version unavailable"; color: root.ink; font.pixelSize: 11; font.bold: true; textFormat: Text.PlainText }
                 }
-
-                Text {
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: {
-                    var v = pointerSlider.dragging ? pointerSlider.liveValue : root.pointerSpeed
-                    return Model.pointerSpeedLabel(v) + "  " + v.toFixed(1)
-                  }
-                  color: Qt.darker(root.bar.foreground, 1.4)
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              Item {
-                width: parent.width
-                implicitHeight: Math.max(pMinusBtn.implicitHeight, pointerRow.implicitHeight, pPlusBtn.implicitHeight)
-
-                CursorSurface {
-                  id: pMinusSurface
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(32)
-                  height: Style.space(32)
-                  hasCursor: false
-                  foreground: root.bar.foreground
-                  fill: root.hoverFill
-
-                  Text {
-                    id: pMinusBtn
-                    anchors.centerIn: parent
-                    text: "−"
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.heading
-                    opacity: root.pointerSpeed <= -1.0 ? 0.3 : 1.0
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.adjustPointerSpeed(-0.1)
-                    onContainsMouseChanged: if (containsMouse) {
-                      root.cursorActive = true
-                      root.focusSection = "pointer"
-                    }
-                  }
-                }
-
-                CursorSurface {
-                  id: pointerRow
-                  anchors.left: pMinusSurface.right
-                  anchors.right: pPlusSurface.left
-                  anchors.leftMargin: Style.space(4)
-                  anchors.rightMargin: Style.space(4)
-                  anchors.verticalCenter: parent.verticalCenter
-                  height: pointerSlider.implicitHeight + Style.spacing.controlGap
-                  hasCursor: false
-                  foreground: root.bar.foreground
-                  outline: true
-
-                  PanelSlider {
-                    id: pointerSlider
-                    bar: root.bar
-                    anchors.fill: parent
-                    anchors.leftMargin: Style.space(6)
-                    anchors.rightMargin: Style.space(6)
-                    minimum: -1.0
-                    maximum: 1.0
-                    step: 0.1
-                    value: root.pointerSpeed
-                    onMoved: function(v) { root.setPointerSpeed(v) }
-                    onReleased: function(v) {
-                      root.setPointerSpeed(v)
-                      pointerDebounce.stop()
-                      root.commitPointerSpeed()
-                    }
-                  }
-
-                  HoverHandler {
-                    onHoveredChanged: if (hovered) {
-                      root.cursorActive = true
-                      root.focusSection = "pointer"
-                    }
-                  }
-                }
-
-                CursorSurface {
-                  id: pPlusSurface
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(32)
-                  height: Style.space(32)
-                  hasCursor: false
-                  foreground: root.bar.foreground
-                  fill: root.hoverFill
-
-                  Text {
-                    id: pPlusBtn
-                    anchors.centerIn: parent
-                    text: "+"
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.heading
-                    opacity: root.pointerSpeed >= 1.0 ? 0.3 : 1.0
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.adjustPointerSpeed(0.1)
-                    onContainsMouseChanged: if (containsMouse) {
-                      root.cursorActive = true
-                      root.focusSection = "pointer"
-                    }
-                  }
-                }
+                Label { text: "MIT · Fred Nix, on David Fano's Trackpad Plus, on Andrew Kent's touchpad widget"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
               }
             }
           }
-
-          // ========== Toggle rows ==========
-          SettingRow {
-            sectionName: "acceleration"
-            width: parent.width
-            height: Style.space(58)
-            foreground: root.bar.foreground
-            fill: root.hoverFill
-            opacity: root.touchpadEnabled ? 1.0 : 0.4
-            enabled: root.touchpadEnabled
-            Column {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(3)
-              Text {
-                text: "Pointer feel  ›"
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              Text {
-                text: ({ adaptive: "System", flat: "Flat", mac: "Mac-inspired", custom: "Custom" })[root.pointerFeel.profile] + " · Presets and acceleration curve"
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-              }
+          Row {
+            width: parent.width; spacing: 12
+            Rectangle {
+              width: siteText.implicitWidth + 40; height: 44; radius: 10
+              color: siteArea.containsMouse ? Qt.alpha(Color.accent, 0.26) : Qt.alpha(Color.accent, 0.14)
+              border.color: Qt.alpha(Color.accent, siteArea.containsMouse ? 0.9 : 0.55); border.width: 2
+              Behavior on color { ColorAnimation { duration: 120 } }
+              Text { id: siteText; anchors.centerIn: parent; text: "nixfred.com"; color: root.ink; font.pixelSize: 19; font.bold: true; textFormat: Text.PlainText }
+              MouseArea { id: siteArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openLink("site") }
             }
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onContainsMouseChanged: if (containsMouse) { root.cursorActive = true; root.focusSection = "acceleration" }
-              onClicked: root.openCurveEditor()
+            Action { anchors.verticalCenter: parent.verticalCenter; text: "github.com/nixfred/trackpad.pulse"; implicitHeight: 44; onClicked: root.openLink("repo") }
+            Action { anchors.verticalCenter: parent.verticalCenter; text: "More Omarchy plugins →"; implicitHeight: 44; onClicked: root.openLink("plugins") }
+            Label { anchors.verticalCenter: parent.verticalCenter; text: "MIT"; font.pixelSize: 13 }
+          }
+          Row {
+            width: parent.width; spacing: 10
+            Stat { width: (parent.width - 30) / 4; height: 91; label: "VERSION"; value: root.releaseVersion !== "" ? "v" + root.releaseVersion : "—"; hint: "manifest.json, the single source" }
+            Stat { width: (parent.width - 30) / 4; height: 91; label: "RECORDER"; value: root.stale ? "offline" : Pulse.accessLabel(root.snap); hint: "trackpad-pulse.service, user scope"; valueColor: root.stale ? Color.urgent : root.ink }
+            Stat { width: (parent.width - 30) / 4; height: 91; label: "RETENTION"; value: "7 days"; hint: "one row per minute, this machine only" }
+            Stat { width: (parent.width - 30) / 4; height: 91; label: "LEAVES THE BOX"; value: "nothing"; hint: "no network calls, no telemetry upstream" }
+          }
+          Column {
+            width: parent.width; spacing: 6
+            Label { text: "LINEAGE"; font.pixelSize: 10; font.letterSpacing: 1.5 }
+            Label {
+              width: parent.width; wrapMode: Text.WordWrap
+              text: "The Controls and Pointer feel pages are Trackpad Plus by David Fano, whole: per-device settings, the libinput-validated acceleration curve, the journalled state files and their rollback, all unchanged. Trackpad Plus began as Andrew Kent's omarchy-touchpad-widget. Trackpad Pulse adds the recorder, the live chip, the Overview, the Touch lab, the finger-speed map under the curve, and this page."
+            }
+            Row {
+              spacing: 8
+              Action { text: "davefano/omarchy-trackpad-plus →"; implicitHeight: 28; onClicked: root.openLink("upstream") }
+              Action { text: "awkent01/omarchy-touchpad-widget →"; implicitHeight: 28; onClicked: root.openLink("origin") }
             }
           }
-
-          ToggleRow {
-            width: parent.width
-            label: "Natural Scrolling"
-            description: "Scroll content in the direction of finger movement"
-            checked: root.naturalScroll
-            sectionName: "natural"
-            enabled: root.touchpadEnabled
-            onToggled: root.toggleNaturalScroll()
-          }
-
-          ToggleRow {
-            width: parent.width
-            label: "Tap to Click"
-            description: "Tap the touchpad to click"
-            checked: root.tapToClick
-            sectionName: "tap"
-            enabled: root.touchpadEnabled
-            onToggled: root.toggleTapToClick()
-          }
-
-          ToggleRow {
-            width: parent.width
-            label: "Disable While Typing"
-            description: "Ignore touchpad input while typing"
-            checked: root.disableWhileTyping
-            sectionName: "typing"
-            enabled: root.touchpadEnabled
-            onToggled: root.toggleDisableWhileTyping()
-          }
-
-          ToggleRow {
-            width: parent.width
-            label: "Two-Finger Right Click"
-            description: "Press with two fingers to right-click"
-            checked: root.clickfingerBehavior
-            sectionName: "clickfinger"
-            enabled: root.touchpadEnabled
-            onToggled: root.toggleClickfingerBehavior()
+          Label {
+            width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+            text: "History stays on this machine in a private state directory. The recorder reads the touchpad's event node only, never a keyboard, and only when your user may open it; it never sends input, never touches settings, and never needs to run as root. The one optional root action, the udev rule, is a two-line constant you can read in the Touch lab."
           }
         }
 
-        Text {
+        // ================= CHOOSER (right-click) =================
+        Column {
           width: parent.width
-          visible: root.releaseVersion !== ""
-          text: "Version " + root.releaseVersion
-          horizontalAlignment: Text.AlignHCenter
-          color: Qt.alpha(root.bar.foreground, 0.6)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-      }
-      }
-    }
-  }
-
-  component SettingRow: CursorSurface {
-    id: settingRow
-    required property string sectionName
-    foreground: root.bar.foreground
-    fill: root.hoverFill
-    radius: 0
-    hasCursor: root.cursorActive && root.focusSection === sectionName
-    z: hasCursor ? 1 : 0
-
-    Rectangle {
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.top: parent.top
-      height: 1
-      color: Qt.alpha(settingRow.foreground, 0.12)
-      visible: !settingRow.hasCursor
-    }
-    Rectangle {
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.bottom: parent.bottom
-      height: 1
-      color: Qt.alpha(settingRow.foreground, 0.12)
-      visible: !settingRow.hasCursor
-    }
-    HoverHandler {
-      onHoveredChanged: if (hovered) {
-        root.cursorActive = true
-        root.focusSection = settingRow.sectionName
-      }
-    }
-  }
-
-  // ========== Reusable toggle row component ==========
-  component ToggleRow: SettingRow {
-    id: toggleRow
-    required property string label
-    required property string description
-    required property bool checked
-    signal toggled()
-
-    hasCursor: root.cursorActive && root.focusSection === sectionName
-    foreground: root.bar.foreground
-    fill: root.hoverFill
-
-    implicitHeight: Math.max(Style.space(58), rowContent.implicitHeight + Style.space(24))
-    opacity: root.touchpadEnabled ? 1.0 : 0.4
-
-    MouseArea {
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onContainsMouseChanged: if (containsMouse) {
-        root.cursorActive = true
-        root.focusSection = toggleRow.sectionName
-      }
-      onClicked: if (toggleRow.enabled) toggleRow.toggled()
-    }
-
-    Item {
-      id: rowContent
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      implicitHeight: Math.max(rowLabels.implicitHeight, rowSwitch.implicitHeight)
-
-      Column {
-        id: rowLabels
-        anchors.left: parent.left
-        anchors.right: rowSwitch.left
-        anchors.rightMargin: Style.space(12)
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(1)
-
-        Text {
-          text: toggleRow.label
-          color: root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
-          width: parent.width
+          spacing: 10
+          visible: root.chooseMode
+          height: visible ? implicitHeight : 0
+          Rectangle {
+            width: parent.width; height: 64; radius: 12
+            color: Qt.alpha(root.touchpadEnabled ? Color.accent : Color.urgent, 0.10)
+            border.color: Qt.alpha(root.touchpadEnabled ? Color.accent : Color.urgent, 0.45)
+            Row {
+              anchors.fill: parent; anchors.margins: 12; spacing: 14
+              Column {
+                width: parent.width - 80; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                Heading { text: root.touchpadEnabled ? "TRACKPAD IS ON" : "TRACKPAD IS OFF"; font.pixelSize: 13 }
+                Label { text: root.touchpadEnabled ? "Switch it off while you type on the keyboard; the setting is per device and survives reloads." : "Nothing on the pad reaches the cursor. Switch it back on here or from a keyboard shortcut over IPC."; font.pixelSize: 10; width: parent.width; wrapMode: Text.WordWrap }
+              }
+              ToggleSwitch { anchors.verticalCenter: parent.verticalCenter; checked: root.touchpadEnabled; foreground: root.ink; onToggled: root.toggleTouchpad() }
+            }
+          }
+          Row {
+            spacing: 8
+            Action { text: "Open the dashboard →"; accent: root.tint; selected: true; onClicked: { root.chooseMode = false; root.active = "overview" } }
+            Action { text: "Controls"; onClicked: { root.chooseMode = false; root.active = "controls" } }
+            Action { text: "Pointer feel"; onClicked: { root.chooseMode = false; root.active = "feel" } }
+            Action { text: root.animated ? "Icon animation: on" : "Icon animation: off"; selected: root.animated; accent: root.tint; onClicked: root.setSetting("animated", !root.animated) }
+          }
+          Label { text: "The icon is the pad itself: it lights where your fingers are and dims when the pad is off.  ·  Esc closes"; font.pixelSize: 10; width: parent.width; wrapMode: Text.WordWrap }
         }
 
-        Text {
-          visible: toggleRow.description !== ""
-          text: toggleRow.description
-          color: Qt.darker(root.bar.foreground, 1.5)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-          width: parent.width
-          wrapMode: Text.WordWrap
+        Rectangle { width: parent.width; height: 1; color: root.rule }
+        Label {
+          width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+          color: root.actionStatus !== "" ? root.ink : root.stale ? Color.urgent : root.inkDim
+          text: root.actionStatus || (root.stale ? "Recorder offline · settings still work · start it from Overview or the Touch lab · Esc closes"
+            : "LIVE · updated " + Qt.formatTime(new Date(Pulse.num(root.snap.ts) * 1000), "h:mm:ss AP") + "  ·  History stays on this machine  ·  ←→ switches pages  ·  Esc closes")
         }
-      }
-
-      ToggleSwitch {
-        id: rowSwitch
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        checked: toggleRow.checked
-        foreground: root.bar.foreground
-        onToggled: if (toggleRow.enabled) toggleRow.toggled()
       }
     }
   }

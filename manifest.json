@@ -1,21 +1,20 @@
 {
   "schemaVersion": 1,
-  "id": "davefano.trackpad-plus",
-  "name": "Trackpad Plus",
-  "version": "2026.09.13.1",
-  "author": "David Fano",
-  "description": "Fine-grained, per-device trackpad controls and pointer-feel tuning for Omarchy.",
-  "kinds": [
-    "bar-widget"
-  ],
-  "entryPoints": {
-    "barWidget": "Panel.qml"
-  },
+  "id": "nixfred.trackpad-pulse",
+  "name": "Trackpad Pulse",
+  "version": "1.0.0",
+  "author": "Fred Nix",
+  "license": "MIT",
+  "description": "Your trackpad as a live instrument: fingers, taps, gestures, speed and seven days of history, on top of Trackpad Plus's per-device controls and pointer-feel curve.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Panel.qml"},
   "barWidget": {
-    "displayName": "Trackpad Plus",
-    "description": "Fine-grained, per-device trackpad controls and pointer-feel tuning for Omarchy.",
+    "displayName": "Trackpad Pulse",
+    "description": "A glowing trackpad on the bar that lights where your fingers are. Behind it: touches, taps, scrolls, swipes, palms, distance and speed with a week of history, a finger-speed map under the acceleration curve, and every Trackpad Plus control. Right-click chooses the readout.",
     "category": "Input",
     "allowMultiple": false,
     "defaultSection": "right"
-  }
+  },
+  "repository": "https://github.com/nixfred/trackpad.pulse",
+  "homepage": "https://nixfred.com"
 }

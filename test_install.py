@@ -211,8 +211,8 @@ else:
 
     def test_new_identity_preserves_legacy_state_and_repairs_missing_rules(self):
         manifest = json.loads((self.plugin / 'manifest.json').read_text())
-        self.assertEqual(manifest['id'], 'davefano.trackpad-plus')
-        self.assertEqual(manifest['name'], 'Trackpad Plus')
+        self.assertEqual(manifest['id'], 'nixfred.trackpad-pulse')
+        self.assertEqual(manifest['name'], 'Trackpad Pulse')
         self.call('state')
         self.call('set', 'apple', 'sensitivity', '-0.4')
         state_path = self.root / 'state/omarchy/local-touchpads/settings.json'
@@ -226,7 +226,7 @@ else:
             self.call('state')
             self.assertEqual(state_path.read_bytes(), saved)
             self.assertIn('sensitivity = -0.4', generated.read_text())
-            self.assertIn('davefano.trackpad-plus', generated.read_text())
+            self.assertIn('nixfred.trackpad-pulse', generated.read_text())
 
     def test_slow_scrolling_persists_without_changing_pointer_curve(self):
         self.call('state')

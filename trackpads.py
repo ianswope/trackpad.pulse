@@ -173,7 +173,7 @@ def group_devices(mice):
 
 def lua_for(groups):
     # hyprctl interprets an argument starting with '--' as a CLI flag.
-    lines = ['do -- Managed by davefano.trackpad-plus. Change settings in Trackpad Plus.']
+    lines = ['do -- Managed by nixfred.trackpad-pulse (the Trackpad Plus backend). Change settings in Trackpad Pulse.']
     for group in groups.values():
         if not group.get('configured', True):
             continue

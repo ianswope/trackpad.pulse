@@ -18,6 +18,12 @@ FocusScope {
   property bool busy: false
   property string settingsError: ""
   property bool canRestore: false
+  // Where the fingers actually spend their time, from the Trackpad Pulse
+  // recorder: seconds of movement per speed bin, drawn under the curve on the
+  // same x axis. Empty when nothing has been recorded.
+  property var speedHistogram: []
+  property real histogramBinUnits: 5 / 25.4
+  property color histogramColor: accent
   property bool numberPending: false
   property int hits: 0
   property int targetIndex: 0
@@ -42,6 +48,7 @@ FocusScope {
     draft = { profile: "custom", curve: Curve.adjust(draft.curve, handle, value, precise, gainMaximum) }
   }
   onDraftChanged: graph.requestPaint()
+  onSpeedHistogramChanged: graph.requestPaint()
   onGainMaximumChanged: graph.requestPaint()
   onForegroundChanged: graph.requestPaint()
   onAccentChanged: graph.requestPaint()
@@ -233,6 +240,19 @@ FocusScope {
             ctx.reset()
             ctx.fillStyle = Qt.alpha(editor.accent, 0.09)
             ctx.fillRect(plot.px(0), plot.topInset, plot.px(editor.draft.curve.start) - plot.px(0), plot.plotHeight)
+            // The recorded finger-speed distribution, as bars under the curve.
+            var bins = editor.speedHistogram || [], peakBin = 0
+            for (var b = 0; b < bins.length; b++) peakBin = Math.max(peakBin, Number(bins[b]) || 0)
+            if (peakBin > 0) {
+              ctx.fillStyle = Qt.alpha(editor.histogramColor, 0.22)
+              for (var h = 0; h < bins.length; h++) {
+                var left = h * editor.histogramBinUnits
+                if (left >= 4) break
+                var right = Math.min(4, (h + 1) * editor.histogramBinUnits)
+                var share = (Number(bins[h]) || 0) / peakBin
+                ctx.fillRect(plot.px(left) + 0.5, plot.topInset + plot.plotHeight * (1 - share * 0.85), Math.max(1, plot.px(right) - plot.px(left) - 1), plot.plotHeight * share * 0.85)
+              }
+            }
             ctx.lineWidth = 1
             ctx.font = (10 * editor.uiScale) + "px sans-serif"
             ctx.textAlign = "right"

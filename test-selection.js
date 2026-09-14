@@ -121,9 +121,10 @@ function context() {
 
 {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.id, 'davefano.trackpad-plus');
-  assert.match(qml, /ipcTarget: "davefano\.trackpad-plus"/);
-  assert.match(qml, /manageIpc: true/);
+  assert.equal(manifest.id, 'nixfred.trackpad-pulse');
+  assert.match(qml, /ipcTarget: "nixfred\.trackpad-pulse"/);
+  assert.match(qml, /manageIpc: false/);
+  for (const verb of ['open', 'close', 'show', 'hide', 'toggle']) assert.match(qml, new RegExp('function ' + verb + '\\(\\): void'), 'own IpcHandler keeps the ' + verb + ' verb');
   assert.match(qml, /root\.receiveState\(String\(text\)\)/);
   assert.match(qml, /Qt\.callLater\(function\(\) \{ root\.finishStateRead\(code\) \}\)/);
   assert.match(qml, /Qt\.callLater\(function\(\) \{ root\.finishAction\(code\) \}\)/);
@@ -144,7 +145,7 @@ function context() {
   ctx.setScrollFactor(0.056);
   assert.equal(ctx.scrollFactor, 0.06);
 }
-console.log('Passed: device selection, fine scroll steps, stale-read rejection, debounce ordering, timeout recovery, and IPC configuration.');
+console.log('Passed: device selection, fine scroll steps, stale-read rejection, debounce ordering, timeout recovery, IPC configuration, and Pulse readouts.');
 
 {
   const ctx = context();
@@ -218,4 +219,26 @@ console.log('Passed: device selection, fine scroll steps, stale-read rejection, 
   assert.equal(ctx.scrollScale, 1);
   assert.equal(ctx.scrollFactor, 0.2);
   assert.equal(ctx.Model.clampScrollFactor(3), 1);
+}
+
+{
+  const Pulse = require('./Pulse.js');
+  assert.equal(Pulse.distance(999), '999 mm');
+  assert.equal(Pulse.distance(12345), '12.3 m');
+  assert.equal(Pulse.speed(84.4), '84 mm/s');
+  assert.equal(Pulse.duration(4000), '1 h 07 min');
+  const hist = new Array(31).fill(0); hist[3] = 2; hist[10] = 1; hist[20] = 1;
+  assert.equal(Pulse.percentile(hist, 5, 0.5), 20, 'median lands at the top of the bin that crosses half');
+  assert.equal(Pulse.percentile(hist, 5, 0.9), 105);
+  assert.ok(Math.abs(Pulse.shareBelow(hist, 5, 52.5) - 0.625) < 1e-9, 'a partial bin is pro-rated');
+  assert.ok(Math.abs(Pulse.curveToMm(4, 25.4) - 101.6) < 1e-9);
+  const snap = { warm: true, ts: 100, access: 'evdev', lastTouch: 90, pads: [{ hz: 125 }], today: { counts: { touches: 42, taps: 3, taps2: 1, taps3: 0, clicks: 2, palms: 1, distance: 1234, active: 61 }, peak: 220 } };
+  assert.equal(Pulse.readout(snap, {}, 0), '42');
+  assert.equal(Pulse.readout(snap, {}, 2), '4');
+  assert.equal(Pulse.readout(snap, {}, 5), '125 Hz');
+  assert.equal(Pulse.verdict(snap, { pads: [{ fingers: [{ x: 0.5, y: 0.5, palm: false }], speed: 200 }] }, true, true, 100), 'FAST SWIPE');
+  assert.equal(Pulse.verdict(snap, {}, false, true, 100), 'TRACKPAD OFF');
+  assert.equal(Pulse.verdict({ warm: true, ts: 0, access: 'evdev' }, {}, true, true, 100), 'RECORDER STALE');
+  assert.equal(Pulse.verdict(Object.assign({}, snap, { access: 'cursor' }), {}, true, true, 100), 'CURSOR ONLY · NO PAD ACCESS');
+  assert.equal(Pulse.readout(Object.assign({}, snap, { access: 'cursor', today: { counts: {}, cursor: { distance: 4321 } } }), {}, 1), '4,321 px');
 }

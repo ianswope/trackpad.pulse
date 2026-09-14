@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix='trackpad-plus-lint-') as directory:
                 continue
             message = warning['message']
             host_property = warning['id'] == 'missing-property' and re.fullmatch(
-                r'Member "(foreground|fontFamily|body|caption|controlGap|display|heading|rowPaddingX|title)" not found on type "QObject"', message)
+                r'Member "(foreground|fontFamily|body|caption|controlGap|display|heading|rowPaddingX|title|shell|family|text|background)" not found on type "QObject"', message)
             host_signal = warning['id'] == 'signal-handler-parameters' and message == (
                 'Type QProcess::ExitStatus of parameter exitStatus in signal called exited was not found, '
                 'but is required to compile onExited. Did you add all imports and dependencies?')
