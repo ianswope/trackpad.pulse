@@ -567,6 +567,81 @@ class OptimizerTests(unittest.TestCase):
             self.assertEqual(out['previous']['judgement'], 'kept by you')
 
 
+class StrayTouchTests(unittest.TestCase):
+    def rec(self, **kw):
+        base = {'kind': 'move', 'fingers': 1, 'duration': 0.15, 'dist': 2.5, 'mean': 16.0, 'cursor': 6.0, 'gap': 5.0, 'x0': 0.5, 'y0': 0.5, 'clicked': False}
+        base.update(kw)
+        return base
+
+    def test_a_brief_touch_on_a_cold_pad_that_moved_the_cursor_is_a_brush(self):
+        self.assertEqual(tp.stray_kind(self.rec()), 'brush')
+        self.assertEqual(tp.stray_kind(self.rec(gap=None)), 'brush', 'the first touch after start counts as cold')
+
+    def test_the_same_touch_on_a_warm_pad_is_a_deliberate_nudge(self):
+        self.assertEqual(tp.stray_kind(self.rec(gap=0.4)), '')
+
+    def test_a_touch_that_did_not_move_the_cursor_is_not_a_stray(self):
+        self.assertEqual(tp.stray_kind(self.rec(cursor=0.0)), '')
+        self.assertEqual(tp.stray_kind(self.rec(cursor=1.5)), '')
+
+    def test_a_click_or_a_second_finger_means_it_was_meant(self):
+        self.assertEqual(tp.stray_kind(self.rec(clicked=True)), '')
+        self.assertEqual(tp.stray_kind(self.rec(fingers=2, kind='scroll')), '')
+        self.assertEqual(tp.stray_kind(self.rec(kind='tap')), '')
+
+    def test_a_slow_short_drift_from_the_thumb_strip_or_a_side_edge_is_a_rest(self):
+        rest = dict(duration=0.9, dist=6.0, mean=7.0, gap=0.5)
+        self.assertEqual(tp.stray_kind(self.rec(y0=0.93, x0=0.3, **rest)), 'rest')
+        self.assertEqual(tp.stray_kind(self.rec(x0=0.03, y0=0.4, **rest)), 'rest')
+        self.assertEqual(tp.stray_kind(self.rec(x0=0.97, y0=0.4, **rest)), 'rest')
+        self.assertEqual(tp.stray_kind(self.rec(x0=0.5, y0=0.5, **rest)), '', 'the middle of the pad is where real moves start')
+        self.assertEqual(tp.stray_kind(self.rec(y0=0.93, x0=0.3, duration=0.4, dist=25.0, mean=60.0, gap=0.5)), '', 'a fast long move from the edge is a move')
+
+    def test_the_guard_waits_then_puts_back_unless_something_else_drives(self):
+        pending = {'at': 100.0, 'to': (10, 10), 'end': (30, 30), 'kind': 'brush'}
+        self.assertEqual(tp.guard_verdict(pending, 100.1, False, 0.0), 'wait')
+        self.assertEqual(tp.guard_verdict(pending, 100.1, True, 0.0), 'cancel', 'a finger is back: the touch continues')
+        self.assertEqual(tp.guard_verdict(pending, 100.4, False, 0.0), 'revert')
+        self.assertEqual(tp.guard_verdict(pending, 100.4, False, 9.0), 'cancel', 'the cursor moved since the lift: a mouse is driving')
+
+    def test_a_real_move_right_after_a_put_back_is_a_regret(self):
+        last = {'at': 200.0, 'to': (10, 10)}
+        self.assertTrue(tp.is_regret({'kind': 'move', 'dist': 12.0, 'start': 200.6}, last))
+        self.assertFalse(tp.is_regret({'kind': 'move', 'dist': 2.0, 'start': 200.6}, last), 'another brush is not a regret')
+        self.assertFalse(tp.is_regret({'kind': 'move', 'dist': 12.0, 'start': 202.0}, last), 'too late to be a continuation')
+        self.assertFalse(tp.is_regret({'kind': 'tap', 'dist': 0.0, 'start': 200.2}, last))
+        self.assertFalse(tp.is_regret({'kind': 'move', 'dist': 12.0, 'start': 200.2}, None))
+
+    def test_sessions_carry_start_position_gap_and_click_and_round_trip_the_new_columns(self):
+        p = pad()
+        FingerprintTests.drag(self, p, 1, 200, 2300, 200 + 3 * RES, 2300, 100.0, 0.15)
+        FingerprintTests.drag(self, p, 2, 2000, 1000, 2000 + 25 * RES, 1000, 104.0, 0.3)
+        a, b = p.sessions
+        self.assertLess(a['x0'], 0.1)
+        self.assertGreater(a['y0'], 0.85)
+        self.assertIsNone(a['gap'])
+        self.assertAlmostEqual(b['gap'], 104.0 - 100.15, places=1)
+        self.assertFalse(b['clicked'])
+        self.assertEqual(b['stray'], '')
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            db = tp.db_open()
+            a['cursor'], a['stray'] = 5.0, 'rest'
+            tp.record_sessions(db, [a, b])
+            rows = tp.load_sessions(db, 0)
+            self.assertEqual((rows[0]['stray'], rows[0]['cursor']), ('rest', 5.0))
+            self.assertLess(rows[0]['x0'], 0.1)
+            self.assertIsNone(rows[0]['gap'])
+            today = tp.Recorder._fresh_today(None, 1_000_000.0)
+            today['counts']['strays'], today['counts']['strayReverts'], today['counts']['strayRegrets'] = 4, 2, 1
+            tp.record_day(db, today)
+            self.assertEqual(db.execute('SELECT strays, strayReverts, strayRegrets FROM days').fetchone(), (4, 2, 1))
+            s = tp.stray_summary(db, today, 1_000_000.0 + 86400)
+            self.assertEqual((s['week'], s['reverts'], s['regrets']), (4, 2, 1))
+            self.assertIn('strayHeat', today)
+            self.assertEqual(len(today['strayHeat']), tp.HEAT_W * tp.HEAT_H)
+
+
 class DataFeatureTests(unittest.TestCase):
     def test_heat_and_hours_accumulate_per_finger_frame(self):
         p = pad()

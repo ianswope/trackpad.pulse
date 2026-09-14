@@ -10,6 +10,8 @@ Gestures: every 3- and 4-finger swipe and pinch Hyprland supports, each assigned
 
 Report: this week vs last, per-day bars, which hand you use (from thumb and palm positions), mouse vs trackpad share by active time, opt-in auto-off (15 s of mouse use turns the pad off; a tap or 10 mm move turns it back on), touches per app, optimize history.
 
+Stray touches: names a brush (under 0.25 s and 4 mm on an idle pad) or a rest (a slow drift from the thumb strip or a side edge) that moved the cursor, counts them, maps where they start. Opt-in put-back: 0.3 s after a stray lifts, with no finger back and no mouse moving, the cursor is warped to where it was. Regrets counted. Off by default.
+
 Access: no input group. Reads the pad if permitted, otherwise cursor-only, with an optional udev rule scoped to touchpads via one polkit prompt. Nothing leaves the machine. No page scrolls.
 
 Built on Trackpad Plus by @davidfano, kept whole: per-device controls, libinput-validated curve editor, journalled state, his test suite still passing. Trackpad Plus was built on Andrew Kent's omarchy-touchpad-widget. MIT, both names retained.

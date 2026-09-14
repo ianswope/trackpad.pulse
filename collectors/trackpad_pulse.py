@@ -52,6 +52,22 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 GESTURES_LUA = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'omarchy/toggles/hypr/zz-trackpad-pulse-gestures.lua'
 HINT_INTERVAL = 600
 AUTO_OFF_MARKER = 'auto-off'
+# Stray touches: a touch that looks accidental and moved the cursor. A brush is
+# a brief, short touch on a pad that sat idle; a rest is a slow, short drift
+# that began in the thumb strip at the bottom or the palm strips at the sides.
+STRAY_GUARD_MARKER = 'stray-guard'
+STRAY_BRUSH_S = 0.25
+STRAY_BRUSH_MM = 4.0
+STRAY_COLD_S = 2.0
+STRAY_REST_MM = 10.0
+STRAY_REST_MM_S = 15.0
+STRAY_EDGE = 0.08
+STRAY_BOTTOM = 0.85
+STRAY_CURSOR_PX = 2.0
+STRAY_HOLD = 0.3           # the guard waits this long after the finger lifts
+STRAY_DRIFT_PX = 4.0       # cursor moved this much after the lift: a mouse is driving, leave it
+STRAY_REGRET_S = 1.0       # a real move this soon after a put-back means the guard was wrong
+STRAY_REGRET_MM = 4.0
 AUTO_OFF_AFTER = 15.0      # seconds of continuous mouse motion before the pad goes off
 AUTO_OFF_MIN = 5.0         # seconds the pad stays off before a touch may bring it back
 MOUSE_GAP = 3.0            # seconds without cursor motion that end a mouse streak
@@ -114,7 +130,8 @@ RETENTION = 7 * 86400
 
 COUNTERS = ('touches', 'taps', 'taps2', 'taps3', 'clicks', 'rightClicks', 'moves', 'scrolls', 'pinches',
             'swipes3', 'swipes4', 'palms', 'distance', 'scroll', 'active', 'moving', 'frames',
-            'longMoves', 'corrections', 'restrokes', 'scrollCorrections', 'scrollRestrokes')
+            'longMoves', 'corrections', 'restrokes', 'scrollCorrections', 'scrollRestrokes',
+            'strays', 'strayReverts', 'strayRegrets')
 
 # A wrong curve leaves fingerprints. An overshoot is a move followed at once by
 # a short move back the other way; a re-stroke is a long move followed at once
@@ -357,7 +374,9 @@ class Pad:
                 lead = active[0]
                 self.session = {'start': now, 'max': 0, 'dist': 0.0, 'palm': False, 'clicked': False, 'gap0': None, 'gapMax': 0.0,
                                 'peak': 0.0, 'lead': next((k for k, s in self.slots.items() if s is lead), None),
-                                'x0': lead['x'] / self.res_x, 'y0': lead['y'] / self.res_y, 'x1': lead['x'] / self.res_x, 'y1': lead['y'] / self.res_y}
+                                'x0': lead['x'] / self.res_x, 'y0': lead['y'] / self.res_y, 'x1': lead['x'] / self.res_x, 'y1': lead['y'] / self.res_y,
+                                'nx0': (lead['x'] - self.range_x[0]) / (self.range_x[1] - self.range_x[0]),
+                                'ny0': (lead['y'] - self.range_y[0]) / (self.range_y[1] - self.range_y[0])}
                 self.counts['touches'] += 1
                 self.hours[time.localtime().tm_hour] += 1
             ses = self.session
@@ -423,7 +442,9 @@ class Pad:
         rec = {'wall': time.time(), 'start': ses['start'], 'end': now, 'kind': kind, 'fingers': ses['max'],
                'duration': round(now - ses['start'], 3), 'dist': round(ses['dist'], 2), 'peak': round(ses['peak'], 1),
                'mean': round(ses['dist'] / max(0.01, now - ses['start']), 1),
-               'dx': round(ses['x1'] - ses['x0'], 2), 'dy': round(ses['y1'] - ses['y0'], 2), 'flag': '', 'ref': 0.0, 'app': ses.get('app', '')}
+               'dx': round(ses['x1'] - ses['x0'], 2), 'dy': round(ses['y1'] - ses['y0'], 2), 'flag': '', 'ref': 0.0, 'app': ses.get('app', ''),
+               'x0': round(ses.get('nx0', 0.5), 3), 'y0': round(ses.get('ny0', 0.5), 3), 'clicked': bool(ses['clicked']),
+               'gap': round(ses['start'] - self.prev['end'], 2) if self.prev else None, 'cursor0': ses.get('cursor0'), 'cursor': 0.0, 'stray': ''}
         rec['flag'], rec['ref'] = flag_session(rec, self.prev)
         if kind == 'move' and rec['dist'] >= LONG_MOVE_MM:
             self.counts['longMoves'] += 1
@@ -516,6 +537,60 @@ def classify(ses, now):
             return 'pinch'
         return 'scroll' if ses['dist'] >= TAP_MM else 'move'
     return 'move'
+
+
+# ---- stray touches: naming them, and the guard that puts the cursor back ------
+def stray_kind(rec):
+    """Name a one-finger move that looks accidental, or ''. Pure.
+
+    'brush': shorter than STRAY_BRUSH_S and STRAY_BRUSH_MM on a pad that had
+    sat idle for STRAY_COLD_S. 'rest': a slow drift under STRAY_REST_MM that
+    began in the bottom thumb strip or a side palm strip. Both only count when
+    the cursor actually moved; a click or a second finger means it was meant.
+    """
+    if rec.get('kind') != 'move' or rec.get('clicked') or int(rec.get('fingers') or 1) != 1:
+        return ''
+    if float(rec.get('cursor') or 0.0) < STRAY_CURSOR_PX:
+        return ''
+    gap = rec.get('gap')
+    if rec['duration'] < STRAY_BRUSH_S and rec['dist'] < STRAY_BRUSH_MM and (gap is None or gap >= STRAY_COLD_S):
+        return 'brush'
+    x0, y0 = rec.get('x0'), rec.get('y0')
+    if x0 is None or y0 is None:
+        return ''
+    edge = x0 <= STRAY_EDGE or x0 >= 1.0 - STRAY_EDGE or y0 >= STRAY_BOTTOM
+    if edge and rec['dist'] < STRAY_REST_MM and rec['mean'] < STRAY_REST_MM_S:
+        return 'rest'
+    return ''
+
+
+def guard_verdict(pending, now, touching, drift):
+    """What the guard does with a queued put-back: 'wait', 'cancel' or 'revert'. Pure.
+
+    It waits STRAY_HOLD after the finger lifted so a touch that continues is
+    left alone, and it cancels when a finger is back on the pad or the cursor
+    has since moved on its own, because then something else is driving.
+    """
+    if touching:
+        return 'cancel'
+    if now - pending['at'] < STRAY_HOLD:
+        return 'wait'
+    if drift > STRAY_DRIFT_PX:
+        return 'cancel'
+    return 'revert'
+
+
+def is_regret(rec, last_revert):
+    """A real move right after a put-back: the guard undid something meant. Pure."""
+    if not last_revert or rec.get('kind') != 'move':
+        return False
+    return rec['dist'] >= STRAY_REGRET_MM and 0.0 <= rec['start'] - last_revert['at'] <= STRAY_REGRET_S
+
+
+def warp_cursor(x, y):
+    result = subprocess.run(['hyprctl', 'dispatch', 'hl.dsp.cursor.move({ x = %.2f, y = %.2f })' % (float(x), float(y))],
+                            capture_output=True, text=True, timeout=2, check=False)
+    return result.returncode == 0 and 'ok' in (result.stdout or '')
 
 
 # ---- which hand, from where the fingers and palms land ------------------------
@@ -710,9 +785,14 @@ def db_open():
     # One row per calendar day, kept forever: a year is 365 short rows.
     db.execute('CREATE TABLE IF NOT EXISTS days (day TEXT PRIMARY KEY, touches INTEGER, taps INTEGER, clicks INTEGER, moves INTEGER, '
                'scrolls INTEGER, gestures INTEGER, palms INTEGER, distance REAL, scroll REAL, active REAL, moving REAL, peak REAL)')
-    for column, kind in (('mouse', 'REAL DEFAULT 0'), ('apps', 'TEXT')):
+    for column, kind in (('mouse', 'REAL DEFAULT 0'), ('apps', 'TEXT'), ('strays', 'INTEGER DEFAULT 0'), ('strayReverts', 'INTEGER DEFAULT 0'), ('strayRegrets', 'INTEGER DEFAULT 0')):
         try:
             db.execute('ALTER TABLE days ADD COLUMN %s %s' % (column, kind))
+        except sqlite3.OperationalError:
+            pass
+    for column, kind in (('x0', 'REAL'), ('y0', 'REAL'), ('gap', 'REAL'), ('cursor', 'REAL DEFAULT 0'), ('stray', 'TEXT DEFAULT \'\'')):
+        try:
+            db.execute('ALTER TABLE sessions ADD COLUMN %s %s' % (column, kind))
         except sqlite3.OperationalError:
             pass
     return db
@@ -720,12 +800,23 @@ def db_open():
 
 def record_day(db, today):
     c = today['counts']
-    db.execute('INSERT OR REPLACE INTO days VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    db.execute('INSERT OR REPLACE INTO days VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                (today['day'], c['touches'], c['taps'] + c['taps2'] + c['taps3'], c['clicks'] + c['rightClicks'], c['moves'], c['scrolls'],
                 c['pinches'] + c['swipes3'] + c['swipes4'], c['palms'], round(c['distance'], 1), round(c['scroll'], 1),
                 round(c['active'], 1), round(c['moving'], 1), round(today.get('peak', 0.0), 1),
-                round((today.get('mouse') or {}).get('active', 0.0), 1), json.dumps(today.get('apps') or {})))
+                round((today.get('mouse') or {}).get('active', 0.0), 1), json.dumps(today.get('apps') or {}),
+                c.get('strays', 0), c.get('strayReverts', 0), c.get('strayRegrets', 0)))
     db.commit()
+
+
+def stray_summary(db, today, now):
+    """Stray touches this week and today, and how the guard did."""
+    row = db.execute('SELECT SUM(strays), SUM(strayReverts), SUM(strayRegrets) FROM days WHERE day >= ? AND day < ?',
+                     (day_key(now - 6 * 86400), today['day'])).fetchone()
+    c = today['counts']
+    return {'today': c.get('strays', 0), 'week': (row[0] or 0) + c.get('strays', 0),
+            'reverts': (row[1] or 0) + c.get('strayReverts', 0), 'regrets': (row[2] or 0) + c.get('strayRegrets', 0),
+            'revertsToday': c.get('strayReverts', 0), 'regretsToday': c.get('strayRegrets', 0)}
 
 
 def report(db, today, log, now):
@@ -763,6 +854,7 @@ def report(db, today, log, now):
             'apps': [{'app': name, **vals} for name, vals in top], 'hand': hand,
             'palms': {'today': today['counts']['palms'], 'x': round(today.get('palmX', 0.0) / max(1, today.get('palmN', 0)), 2) if today.get('palmN') else None},
             'autoOff': {'today': today.get('autoOff', 0)},
+            'strays': stray_summary(db, today, now),
             'optimize': [{'ts': e['ts'], 'changes': [c.get('label', c.get('key')) for c in e.get('changes', [])], 'before': (e.get('evidence') or {}).get('correctionRate'),
                           'verdict': e.get('verdict', ''), 'judgement': e.get('judgement') or ('undo' if e.get('undo') else 'watching'),
                           'reason': e.get('judgeReason', ''), 'undo': bool(e.get('undo'))} for e in (log or []) if e.get('applied')][-5:]}
@@ -807,14 +899,15 @@ def windows(db, today, now, recent=None):
 def record_sessions(db, recs):
     if not recs:
         return
-    db.executemany('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                   [(r['wall'], r['kind'], r['fingers'], r['duration'], r['dist'], r['peak'], r['mean'], r['dx'], r['dy'], r['flag'], r['ref']) for r in recs])
+    db.executemany('INSERT INTO sessions (ts, kind, fingers, duration, dist, peak, mean, dx, dy, flag, ref, x0, y0, gap, cursor, stray) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   [(r['wall'], r['kind'], r['fingers'], r['duration'], r['dist'], r['peak'], r['mean'], r['dx'], r['dy'], r['flag'], r['ref'],
+                     r.get('x0'), r.get('y0'), r.get('gap'), r.get('cursor', 0.0), r.get('stray', '')) for r in recs])
     db.commit()
 
 
 def load_sessions(db, since):
-    keys = ('ts', 'kind', 'fingers', 'duration', 'dist', 'peak', 'mean', 'dx', 'dy', 'flag', 'ref')
-    return [dict(zip(keys, row)) for row in db.execute('SELECT ts,kind,fingers,duration,dist,peak,mean,dx,dy,flag,ref FROM sessions WHERE ts >= ? ORDER BY ts', (since,))]
+    keys = ('ts', 'kind', 'fingers', 'duration', 'dist', 'peak', 'mean', 'dx', 'dy', 'flag', 'ref', 'x0', 'y0', 'gap', 'cursor', 'stray')
+    return [dict(zip(keys, row)) for row in db.execute('SELECT ts,kind,fingers,duration,dist,peak,mean,dx,dy,flag,ref,x0,y0,gap,cursor,stray FROM sessions WHERE ts >= ? ORDER BY ts', (since,))]
 
 
 def load_hist(db, since):
@@ -893,6 +986,17 @@ class Recorder:
         self.pad_off_at = 0.0
         self.auto_off_checked = 0.0
         self.auto_off_wanted = False
+        self.stray_wanted = False
+        self.stray_checked = 0.0
+        self.pending_revert = None
+        self.last_revert = None
+
+    def bump(self, key, n=1):
+        """Count something the recorder itself did, in the minute, the day and the trailing-minute buckets."""
+        self.minute['counts'][key] = self.minute['counts'].get(key, 0) + n
+        self.today['counts'][key] = self.today['counts'].get(key, 0) + n
+        if self.recent:
+            self.recent[-1][1][key] = self.recent[-1][1].get(key, 0) + n
 
     def _load_today(self):
         fresh = self._fresh_today(time.time())
@@ -902,11 +1006,13 @@ class Recorder:
                 # Merge over a fresh record: a release that adds a counter must
                 # not choke on the file the previous release wrote.
                 fresh['counts'].update({k: saved['counts'].get(k, 0) for k in COUNTERS})
-                for key in ('hist', 'peak', 'peakAt', 'lastTouch', 'heat', 'hours', 'palmX', 'palmY', 'palmN', 'apps', 'mouse', 'autoOff'):
+                for key in ('hist', 'peak', 'peakAt', 'lastTouch', 'heat', 'hours', 'palmX', 'palmY', 'palmN', 'apps', 'mouse', 'autoOff', 'strayHeat'):
                     if key in saved:
                         fresh[key] = saved[key]
                 if len(fresh.get('heat') or []) != HEAT_W * HEAT_H:
                     fresh['heat'] = [0] * (HEAT_W * HEAT_H)
+                if len(fresh.get('strayHeat') or []) != HEAT_W * HEAT_H:
+                    fresh['strayHeat'] = [0] * (HEAT_W * HEAT_H)
                 if len(fresh.get('hours') or []) != 24:
                     fresh['hours'] = [0] * 24
                 if isinstance(saved.get('cursor'), dict):
@@ -919,7 +1025,7 @@ class Recorder:
 
     def _fresh_today(self, ts):
         return {'day': day_key(ts), 'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'peakAt': 0.0, 'lastTouch': 0.0,
-                'heat': [0] * (HEAT_W * HEAT_H), 'hours': [0] * 24, 'palmX': 0.0, 'palmY': 0.0, 'palmN': 0, 'apps': {},
+                'heat': [0] * (HEAT_W * HEAT_H), 'strayHeat': [0] * (HEAT_W * HEAT_H), 'hours': [0] * 24, 'palmX': 0.0, 'palmY': 0.0, 'palmN': 0, 'apps': {},
                 'mouse': {'active': 0.0, 'distance': 0.0}, 'autoOff': 0,
                 'cursor': {'distance': 0.0, 'active': 0.0, 'moving': 0.0, 'peak': 0.0, 'peakAt': 0.0, 'hist': [0.0] * (BINS + 1)}}
 
@@ -998,6 +1104,7 @@ class Recorder:
             self.today['palmX'] += palm[0]
             self.today['palmY'] += palm[1]
             self.today['palmN'] += palm[2]
+            self.judge_strays(pad, finished)
             for rec in finished:
                 if rec.get('app'):
                     slot = self.today['apps'].setdefault(rec['app'], {'touches': 0, 'distance': 0.0, 'active': 0.0})
@@ -1084,10 +1191,69 @@ class Recorder:
         return ''
 
     def name_sessions(self):
-        """Stamp each new touch session with the window that had focus when it began."""
+        """Stamp each new touch session with the window that had focus when it began, and where the cursor was."""
         for _, pad in self.pads.values():
             if pad.session is not None and 'app' not in pad.session:
                 pad.session['app'] = self.active_window_class()
+                # The last poll before the touch: with the pad idle the cursor was
+                # not moving, so a poll up to 200 ms old is where it really was.
+                pad.session['cursor0'] = (self.cursor.x, self.cursor.y) if self.cursor.x is not None else None
+
+    def judge_strays(self, pad, finished):
+        """Name the accidental-looking touches among the sessions that just ended, and queue a put-back if asked."""
+        if not finished:
+            return
+        mono = time.monotonic()
+        if any(r.get('cursor0') for r in finished):
+            self.cursor.poll(time.time())
+        for rec in finished:
+            c0 = rec.get('cursor0')
+            if c0 and self.cursor.x is not None:
+                rec['cursor'] = round(math.hypot(self.cursor.x - c0[0], self.cursor.y - c0[1]), 1)
+            if is_regret(rec, self.last_revert):
+                self.bump('strayRegrets')
+                self.last_revert = None
+                print('Trackpad Pulse: put-back regretted: a %.0f mm move followed within %.1f s' % (rec['dist'], rec['start'] - (self.last_revert or {}).get('at', rec['start'])), flush=True)
+            rec['stray'] = stray_kind(rec)
+            if not rec['stray']:
+                continue
+            pad.counts['strays'] += 1
+            cell = min(HEAT_H - 1, max(0, int(rec['y0'] * HEAT_H))) * HEAT_W + min(HEAT_W - 1, max(0, int(rec['x0'] * HEAT_W)))
+            self.today['strayHeat'][cell] += 1
+            if self.stray_wanted and c0:
+                self.pending_revert = {'at': mono, 'to': c0, 'end': (self.cursor.x, self.cursor.y), 'kind': rec['stray']}
+
+    def stray_guard(self, now):
+        """Opt-in: after a stray touch the cursor goes back to where it was before the finger landed.
+
+        The kernel already delivered the motion, so this is a put-back, not a
+        block: STRAY_HOLD after the finger lifts, if nothing else is driving
+        the cursor and no finger is back on the pad, one warp through Hyprland.
+        A real move right after it is counted as a regret, so the Report can
+        say whether the guard is helping or fighting.
+        """
+        if now - self.stray_checked >= 2.0:
+            self.stray_checked = now
+            self.stray_wanted = (STATE / STRAY_GUARD_MARKER).exists()
+        if self.pending_revert is None:
+            return
+        if not self.stray_wanted:
+            self.pending_revert = None
+            return
+        mono = time.monotonic()
+        pending = self.pending_revert
+        drift = 0.0
+        if mono - pending['at'] >= STRAY_HOLD:
+            if self.cursor.poll(now) and self.cursor.x is not None and pending['end'][0] is not None:
+                drift = math.hypot(self.cursor.x - pending['end'][0], self.cursor.y - pending['end'][1])
+        verdict = guard_verdict(pending, mono, self.touching(), drift)
+        if verdict == 'wait':
+            return
+        self.pending_revert = None
+        if verdict == 'revert' and warp_cursor(*pending['to']):
+            self.bump('strayReverts')
+            self.last_revert = {'at': mono, 'to': pending['to']}
+            print('Trackpad Pulse: cursor put back after a %s' % pending['kind'], flush=True)
 
     def watch_mouse(self, now):
         """Five times a second, twenty while it moves: is another pointing device driving the cursor?"""
@@ -1171,6 +1337,7 @@ class Recorder:
         return {'ts': now, 'warm': True, 'access': self.access, 'inputGroup': in_input_group(), 'udevRule': udev_rule_present(), 'windows': spans,
                 'heatW': HEAT_W, 'heatH': HEAT_H, 'mouse': mouse_live,
                 'autoOff': {'enabled': self.auto_off_wanted, 'offNow': self.pad_off_by_us, 'today': self.today.get('autoOff', 0)},
+                'strayGuard': dict(stray_summary(self.db, self.today, now), enabled=self.stray_wanted),
                 'hand': hand_verdict(self.today.get('heat') or [], self.today.get('palmX', 0.0), self.today.get('palmN', 0)),
                 'udevRulePath': str(UDEV_RULE_PATH), 'pads': pads, 'today': self.today, 'week': week,
                 'binMmS': BIN_MM_S, 'bins': BINS, 'mmPerUnitMs': MM_PER_UNIT_MS, 'pid': os.getpid(),
@@ -1205,6 +1372,7 @@ class Recorder:
                 self.watch_mouse(now)
                 self.gather(now)
                 self.auto_off(now)
+                self.stray_guard(now)
                 if self.touching():
                     if now - self.last_live >= LIVE_INTERVAL:
                         self.write_live(now)
@@ -2038,7 +2206,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
                                            'optimize', 'optimize-applied', 'optimize-keep', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
-                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'open-fullscreen'])
+                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'stray-guard-on', 'stray-guard-off', 'open-fullscreen'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
     args = parser.parse_args()
@@ -2075,6 +2243,14 @@ def main():
             except (OSError, ValueError):
                 pass
             value = report(db_open(), today, load_log(), time.time())
+        elif args.action in ('stray-guard-on', 'stray-guard-off'):
+            marker = STATE / STRAY_GUARD_MARKER
+            if args.action == 'stray-guard-on':
+                marker.touch()
+                value = {'message': 'Put-back is on: after a stray touch the cursor goes back to where it was, 0.3 s after the finger lifts.'}
+            else:
+                marker.unlink(missing_ok=True)
+                value = {'message': 'Put-back is off. Stray touches are still counted.'}
         elif args.action in ('auto-off-on', 'auto-off-off'):
             marker = STATE / AUTO_OFF_MARKER
             if args.action == 'auto-off-on':

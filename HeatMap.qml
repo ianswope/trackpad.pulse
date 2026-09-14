@@ -14,6 +14,7 @@ Item {
     property color hot: '#ffa86b'
     property color ink: '#edf5f7'
     property color surface: '#0b141b'
+    property string emptyText: 'Touch the pad and it lights up here'
     readonly property real peak: {
         var m = 0
         for (var i = 0; i < (heat || []).length; i++) m = Math.max(m, Number(heat[i]) || 0)
@@ -57,7 +58,7 @@ Item {
             c.stroke()
             if (root.peak <= 0) {
                 c.fillStyle = Qt.alpha(root.ink, 0.5); c.font = '11px sans-serif'; c.textAlign = 'center'
-                c.fillText('Touch the pad and it lights up here', w / 2, h / 2 + 4)
+                c.fillText(root.emptyText, w / 2, h / 2 + 4)
             }
         }
     }

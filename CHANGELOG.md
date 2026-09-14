@@ -2,6 +2,13 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.6.0 — 2026-09-14
+
+- **Stray touches.** The recorder now names touches that look accidental and moved the cursor: a *brush*, shorter than 0.25 s and 4 mm on a pad that had sat idle for 2 s, and a *rest*, a slow drift under 10 mm that began in the bottom thumb strip or a side edge. A click or a second finger means it was meant. Each session now records where it started, the idle gap before it, whether it clicked and how far the cursor moved. Counted on the Overview strip and the tooltip, kept per day, and mapped on the Touch lab (where they start).
+- **Put back**, opt-in: 0.3 s after a stray touch lifts, if no finger is back on the pad and no mouse has moved the cursor since, the recorder warps the cursor to where it was before the finger landed, through Hyprland's own cursor dispatcher. The kernel already delivered the motion, so this is a put-back, not a block. A real move within a second of a put-back is counted as a regret, and the card says when the guard is fighting you. Never on by default.
+- Touch lab: the day heatmap card, which the Overview hero carries since 1.4.1, becomes the Stray touches card with the map, the counts, the Put back switch and the state of Disable while typing.
+- Recorder: `stray-guard-on`, `stray-guard-off` actions; `strays`, `strayReverts`, `strayRegrets` counters; `x0`, `y0`, `gap`, `cursor`, `stray` session columns; `strayHeat` in today.json; `strayGuard` in the snapshot and `strays` in the report.
+
 ## 1.5.0 — 2026-09-14
 
 - **One change a pass, judged by the next.** Optimize now proposes a single change: the bigger miss of Start and End first, then Fast swipes, Precision, Scroll speed. Everything else the data would change is listed as *seen, waiting its turn*. The only exception is the first fit of a System or Flat profile, which sets the profile, Start and End together because a custom curve cannot exist with only one of them.

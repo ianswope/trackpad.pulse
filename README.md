@@ -84,6 +84,12 @@ Every change comes with its reason and the numbers behind it. Nothing changes un
 
 It cannot tune taps, natural scrolling or the right-click switch; those are preferences with no signal in the touch stream.
 
+### Stray touches
+
+A touch you did not mean still moves the cursor. libinput already drops what the firmware flags as a palm (the pad here reports no pressure or contact size, so that is all it has to go on), and Hyprland's **Disable while typing** covers the keystroke itself. What gets through is the brush after you stop typing and the thumb that rests on the bottom strip while you think. The recorder names both: a **brush** is shorter than 0.25 s and 4 mm on a pad that had sat idle for 2 s; a **rest** is a slow drift under 10 mm that began in the bottom thumb strip or a side edge. Only touches that actually moved the cursor count, and a click or a second finger means it was meant. They are counted on the Overview, kept per day, and mapped on the Touch lab so you can see where they start.
+
+**Put back** is the opt-in neutralizer. 0.3 s after a stray touch lifts, if no finger is back on the pad and no mouse has moved the cursor since, the recorder warps the cursor to where it was before the finger landed, through Hyprland's own cursor dispatcher. The motion already happened, so this is a put-back, not a block; what it removes is the cursor sitting somewhere you did not put it. A real move within a second of a put-back is counted as a regret, the card shows regrets against put-backs, and it tells you when the guard is fighting you. Never on by default.
+
 **It keeps watching.** Every ten minutes the recorder re-runs the same optimizer against the settings you actually have. When a proposal with real changes and at least medium confidence turns up that you have not seen, the Optimize button and the Pointer feel tab light up and the Overview carries a one-line banner with **Review** and **Later**. Nothing is applied for you.
 
 ---

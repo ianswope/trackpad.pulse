@@ -572,11 +572,23 @@ Panel {
   property var reportData: ({})
   property var autoOffLocal: null
   readonly property bool autoOffOn: root.autoOffLocal === null ? !!((root.snap.autoOff || {}).enabled) : !!root.autoOffLocal
-  onSnapChanged: if (root.autoOffLocal !== null && !!((root.snap.autoOff || {}).enabled) === !!root.autoOffLocal) root.autoOffLocal = null
+  onSnapChanged: {
+    if (root.autoOffLocal !== null && !!((root.snap.autoOff || {}).enabled) === !!root.autoOffLocal) root.autoOffLocal = null
+    if (root.strayLocal !== null && !!((root.snap.strayGuard || {}).enabled) === !!root.strayLocal) root.strayLocal = null
+  }
   function loadReport() { if (!pulseProc.running) root.runPulse("report", [], "report") }
   function setAutoOff(on) {
     root.autoOffLocal = on
     root.runPulse(on ? "auto-off-on" : "auto-off-off")
+  }
+  // The stray guard: opt-in, the recorder puts the cursor back after an
+  // accidental-looking touch. Same local-echo pattern as auto-off.
+  property var strayLocal: null
+  readonly property var strayGuard: root.snap.strayGuard || ({})
+  readonly property bool strayGuardOn: root.strayLocal === null ? !!root.strayGuard.enabled : !!root.strayLocal
+  function setStrayGuard(on) {
+    root.strayLocal = on
+    root.runPulse(on ? "stray-guard-on" : "stray-guard-off")
   }
   Timer { interval: 60000; repeat: true; running: root.opened && root.active === "report"; onTriggered: root.loadReport() }
 
@@ -796,7 +808,7 @@ Panel {
       lines.push(root.verdict)
       if (!root.stale) {
         lines.push("Today: " + Pulse.readout(root.snap, root.live, 0) + " touches · " + Pulse.readout(root.snap, root.live, 2) + " taps · " + Pulse.int(root.todayCounts.clicks) + " clicks · " + Pulse.readout(root.snap, root.live, 1))
-        lines.push("Peak " + Pulse.readout(root.snap, root.live, 3) + " · active " + Pulse.readout(root.snap, root.live, 6) + " · " + Pulse.readout(root.snap, root.live, 7) + " palms rejected")
+        lines.push("Peak " + Pulse.readout(root.snap, root.live, 3) + " · active " + Pulse.readout(root.snap, root.live, 6) + " · " + Pulse.readout(root.snap, root.live, 7) + " palms rejected · " + Pulse.int(root.todayCounts.strays) + " stray touches")
         if (root.spans.all) lines.push("Travelled " + Pulse.distance((root.spans.week || {}).distance) + " this week · " + Pulse.distance(root.spans.all.distance) + " all time")
       }
       if (root.hintActive) lines.push("Optimize has a new proposal: " + root.hint.summary)
@@ -1346,12 +1358,12 @@ Panel {
             Repeater {
               model: [
                 { l: "POINTER MOVES", k: "moves" }, { l: "2-FINGER SCROLLS", k: "scrolls" }, { l: "PINCHES", k: "pinches" },
-                { l: "3-FINGER SWIPES", k: "swipes3" }, { l: "4-FINGER SWIPES", k: "swipes4" }, { l: "PALMS REJECTED", k: "palms" }
+                { l: "3-FINGER SWIPES", k: "swipes3" }, { l: "4-FINGER SWIPES", k: "swipes4" }, { l: "PALMS REJECTED", k: "palms" }, { l: "STRAY TOUCHES", k: "strays" }
               ]
               Rectangle {
                 id: gestureCard
                 required property var modelData
-                width: (shell.width - 50) / 6; height: 62; radius: 12; color: root.card; border.color: root.cardEdge
+                width: (shell.width - 60) / 7; height: 62; radius: 12; color: root.card; border.color: root.cardEdge
                 Column {
                   anchors.fill: parent; anchors.margins: 10; spacing: 3
                   Label { text: gestureCard.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }
@@ -1977,7 +1989,7 @@ Panel {
               Row {
                 width: parent.width
                 Heading { text: "OPTIMIZE HISTORY"; font.pixelSize: 12; width: parent.width / 2 }
-                Label { text: Pulse.int(reportPage.wk.palms) + " palms rejected this week" + ((reportPage.rp.palms || {}).x !== null && (reportPage.rp.palms || {}).x !== undefined ? ", landing " + ((reportPage.rp.palms || {}).x >= 0.5 ? "right" : "left") + " of centre" : ""); font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                Label { text: Pulse.int(reportPage.wk.palms) + " palms rejected this week" + ((reportPage.rp.palms || {}).x !== null && (reportPage.rp.palms || {}).x !== undefined ? ", landing " + ((reportPage.rp.palms || {}).x >= 0.5 ? "right" : "left") + " of centre" : "") + "  ·  " + Pulse.int((reportPage.rp.strays || {}).week) + " stray touches, " + Pulse.int((reportPage.rp.strays || {}).reverts) + " put back"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight; elide: Text.ElideLeft }
               }
               Repeater {
                 model: reportPage.rp.optimize || []
@@ -2155,10 +2167,26 @@ Panel {
                 anchors.fill: parent; anchors.margins: 14; spacing: 6
                 Row {
                   width: parent.width
-                  Heading { text: "WHERE YOU TOUCH"; font.pixelSize: 12; width: parent.width / 2 }
-                  Label { text: "today · brighter = more frames"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                  Heading { text: "STRAY TOUCHES"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: "where they start · today"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
                 }
-                HeatMap { width: parent.width; height: 150; heat: root.today.heat || []; cols: Pulse.num(root.snap.heatW) || 32; rows: Pulse.num(root.snap.heatH) || 20; aspect: root.padAspect; tint: root.tint; hot: root.heat; ink: root.ink; surface: Color.background }
+                Row {
+                  width: parent.width; spacing: 12
+                  HeatMap { width: parent.width * 0.42; height: 112; emptyText: "No stray touches yet"; heat: root.today.strayHeat || []; cols: Pulse.num(root.snap.heatW) || 32; rows: Pulse.num(root.snap.heatH) || 20; aspect: root.padAspect; tint: root.tint; hot: root.heat; ink: root.ink; surface: Color.background }
+                  Column {
+                    width: parent.width * 0.58 - 12; spacing: 5
+                    Label { width: parent.width; font.pixelSize: 11; color: root.ink; text: root.stale || root.cursorOnly ? "Needs the recorder on the pad's own node." : Pulse.int(root.strayGuard.today) + " today · " + Pulse.int(root.strayGuard.week) + " this week" }
+                    Label { width: parent.width; font.pixelSize: 10; wrapMode: Text.WordWrap; text: "A brief brush on an idle pad, or a slow drift from the thumb strip or a side edge, that moved the cursor." }
+                    Row {
+                      spacing: 8
+                      Label { text: "Put back"; anchors.verticalCenter: parent.verticalCenter; color: root.ink }
+                      Action { text: "On"; implicitWidth: 52; implicitHeight: 26; selected: root.strayGuardOn; accent: root.tint; enabled: !pulseProc.running && !root.stale; onClicked: root.setStrayGuard(true) }
+                      Action { text: "Off"; implicitWidth: 52; implicitHeight: 26; selected: !root.strayGuardOn; accent: root.tint; enabled: !pulseProc.running && !root.stale; onClicked: root.setStrayGuard(false) }
+                      Label { anchors.verticalCenter: parent.verticalCenter; font.pixelSize: 10; text: Pulse.int(root.strayGuard.reverts) + " put back · " + Pulse.int(root.strayGuard.regrets) + " regretted" + (Pulse.num(root.strayGuard.reverts) >= 10 && Pulse.num(root.strayGuard.regrets) / Pulse.num(root.strayGuard.reverts) > 0.2 ? " · fighting you, consider Off" : "") }
+                    }
+                    Label { width: parent.width; font.pixelSize: 10; wrapMode: Text.WordWrap; text: "Put back warps the cursor to where it was, 0.3 s after the finger lifts, unless a finger is back or a mouse moved it. Disable while typing is " + (root.disableWhileTyping ? "on" : "OFF, see Controls") + "." }
+                  }
+                }
               }
             }
             Card {

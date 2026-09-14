@@ -133,6 +133,19 @@ Auto-off is opt-in via the `auto-off` marker file in the state dir: after
 seen on the still-reporting evdev node runs `enabled true`. Turning the
 setting off restores the pad within a tick. Never make this default-on.
 
+## Stray touches and the put-back guard
+
+`stray_kind()` is pure and names a finished one-finger move as a brush or a
+rest; it needs `cursor` (pixels the cursor moved during the touch, from the
+last cursor poll before the touch to a poll at its end), `gap`, `x0`/`y0`
+(normalised start) and `clicked`, all now on the session record and in the
+`sessions` table. The guard is opt-in via the `stray-guard` marker file:
+`judge_strays()` queues one put-back, `stray_guard()` decides it with the pure
+`guard_verdict()` (wait STRAY_HOLD, cancel on a finger or a mouse drift) and
+warps through `hyprctl dispatch 'hl.dsp.cursor.move({ x, y })'`. `is_regret()`
+counts a real move right after a put-back. The pad on gus reports neither
+pressure nor contact size, so libinput's palm thresholds are not a lever here.
+
 ## Gestures
 
 Hyprland's own: `hl.gesture({ fingers, direction, action })` with directions
