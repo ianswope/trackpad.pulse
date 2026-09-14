@@ -400,6 +400,7 @@ Panel {
     { key: "feel", label: "Pointer feel" },
     { key: "gestures", label: "Gestures" },
     { key: "lab", label: "Touch lab" },
+    { key: "report", label: "Report" },
     { key: "about", label: "About" }
   ]
   readonly property int pageIndex: {
@@ -567,6 +568,18 @@ Panel {
     root.runPulse("gestures-apply", [JSON.stringify(map)], "gestures")
   }
 
+  // ---- the report and auto-off --------------------------------------------
+  property var reportData: ({})
+  property var autoOffLocal: null
+  readonly property bool autoOffOn: root.autoOffLocal === null ? !!((root.snap.autoOff || {}).enabled) : !!root.autoOffLocal
+  onSnapChanged: if (root.autoOffLocal !== null && !!((root.snap.autoOff || {}).enabled) === !!root.autoOffLocal) root.autoOffLocal = null
+  function loadReport() { if (!pulseProc.running) root.runPulse("report", [], "report") }
+  function setAutoOff(on) {
+    root.autoOffLocal = on
+    root.runPulse(on ? "auto-off-on" : "auto-off-off")
+  }
+  Timer { interval: 60000; repeat: true; running: root.opened && root.active === "report"; onTriggered: root.loadReport() }
+
   // ---- the optimizer ----------------------------------------------------
   // A proposal from the recorder: what to change and why, from the shape of
   // the finger-speed distribution and the overshoot / re-stroke rates since
@@ -652,6 +665,7 @@ Panel {
           var r = JSON.parse(String(text))
           if (pulseProc.mode === "optimize" && !r.error) { root.proposal = r; root.actionStatus = "" }
           else if (pulseProc.mode === "catalogue" && !r.error) { root.catalogue = r.actions || []; root.catalogueMeta = r; root.actionStatus = "" }
+          else if (pulseProc.mode === "report" && !r.error) { root.reportData = r; root.actionStatus = "" }
           else if (pulseProc.mode === "gestures" && !r.error) { if (r.gestures) root.setSetting("gestures", r.gestures); root.actionStatus = r.message || "Gestures applied." }
           else root.actionStatus = r.error || r.message || "Done"
         } catch (e) { root.actionStatus = "The recorder helper did not answer." }
@@ -675,6 +689,7 @@ Panel {
     function enable(on: bool): void { root.setTouchpadEnabled(on) }
     function optimize(): void { root.requestOptimize(); root.open() }
     function gestures(): void { root.showPage("gestures"); root.open() }
+    function report(): void { root.showPage("report"); root.open() }
   }
 
   // ---- Lifecycle ----
@@ -699,6 +714,7 @@ Panel {
     if (active === "feel" && opened) { editingCurve = true; curveEditor.begin() }
     else editingCurve = false
     if (active === "gestures") root.loadCatalogue()
+    if (active === "report") root.loadReport()
   }
 
   // Poll while open so external changes are reflected.
@@ -1769,6 +1785,168 @@ Panel {
           }
         }
 
+        // ================= REPORT =================
+        Column {
+          width: parent.width
+          spacing: 12
+          visible: !root.chooseMode && root.active === "report"
+          height: visible ? implicitHeight : 0
+          readonly property var rp: root.reportData || ({})
+          readonly property var wk: rp.week || ({})
+          readonly property var lw: rp.lastWeek || ({})
+          function delta(a, b) { a = Pulse.num(a); b = Pulse.num(b); if (b <= 0) return "no last week yet"; var d = (a - b) / b * 100; return (d >= 0 ? "+" : "") + d.toFixed(0) + "% vs last week" }
+          id: reportPage
+          Row {
+            width: parent.width; spacing: 10
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "THIS WEEK · DISTANCE"; value: Pulse.distance(reportPage.wk.distance); hint: reportPage.delta(reportPage.wk.distance, reportPage.lw.distance) + " · " + (reportPage.wk.days || 0) + " days recorded" }
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "TOUCHES"; value: Pulse.int(reportPage.wk.touches); hint: reportPage.delta(reportPage.wk.touches, reportPage.lw.touches) + " · " + Pulse.int(reportPage.wk.taps) + " taps" }
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "CLICKS"; value: Pulse.int(reportPage.wk.clicks); hint: reportPage.delta(reportPage.wk.clicks, reportPage.lw.clicks) + " · " + Pulse.int(reportPage.wk.gestures) + " gestures" }
+            Stat { width: (parent.width - 30) / 4; height: 96; label: "ACTIVE ON THE PAD"; value: Pulse.duration(reportPage.wk.active); hint: "peak " + Pulse.speed(reportPage.wk.peak) + " · busiest day " + (reportPage.rp.busiestDay || "—") + (reportPage.rp.busiestHour !== null && reportPage.rp.busiestHour !== undefined ? " · busiest hour " + reportPage.rp.busiestHour + ":00" : "") }
+          }
+          Row {
+            width: parent.width; spacing: 10
+            Card {
+              width: parent.width * 0.6 - 5; height: 200
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 6
+                Row {
+                  width: parent.width
+                  Heading { text: "SEVEN DAYS"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: "distance per day · touches below"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                }
+                Item {
+                  id: weekBars
+                  width: parent.width; height: 140
+                  readonly property var days: reportPage.rp.days || []
+                  readonly property real peak: { var m = 1; for (var i = 0; i < weekBars.days.length; i++) m = Math.max(m, Pulse.num(weekBars.days[i].distance)); return m }
+                  Row {
+                    anchors.fill: parent; spacing: 8
+                    Repeater {
+                      model: weekBars.days
+                      Item {
+                        id: dayBar
+                        required property var modelData
+                        width: (weekBars.width - 8 * Math.max(0, weekBars.days.length - 1)) / Math.max(1, weekBars.days.length); height: weekBars.height
+                        Label { anchors.top: parent.top; anchors.horizontalCenter: parent.horizontalCenter; font.pixelSize: 9; text: Pulse.distance(dayBar.modelData.distance) }
+                        Rectangle {
+                          anchors.bottom: parent.bottom; anchors.bottomMargin: 26; anchors.horizontalCenter: parent.horizontalCenter
+                          width: parent.width * 0.7; radius: 3
+                          height: Math.max(2, (weekBars.height - 44) * Pulse.num(dayBar.modelData.distance) / weekBars.peak)
+                          color: dayBar.modelData.day === (root.today.day || "") ? root.tint : Util.alpha(root.tint, 0.45)
+                        }
+                        Label { anchors.bottom: parent.bottom; anchors.bottomMargin: 13; anchors.horizontalCenter: parent.horizontalCenter; font.pixelSize: 9; text: Pulse.int(dayBar.modelData.touches) }
+                        Label { anchors.bottom: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; font.pixelSize: 9; color: root.ink; text: String(dayBar.modelData.day || "").slice(5) }
+                      }
+                    }
+                  }
+                  Label { visible: weekBars.days.length === 0; anchors.centerIn: parent; text: "No days recorded yet." }
+                }
+              }
+            }
+            Card {
+              width: parent.width * 0.4 - 5; height: 200
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 6
+                Heading { text: "YOUR HAND"; font.pixelSize: 12 }
+                Heading {
+                  readonly property var hand: root.snap.hand || reportPage.rp.hand || ({})
+                  text: hand.hand === "right" ? "Right hand" : hand.hand === "left" ? "Left hand" : "Not sure yet"; font.pixelSize: 26; color: root.tint
+                }
+                Label { readonly property var hand: root.snap.hand || reportPage.rp.hand || ({}); text: hand.confidence ? "confidence " + Pulse.pct(hand.confidence) : ""; font.pixelSize: 10 }
+                Label { readonly property var hand: root.snap.hand || reportPage.rp.hand || ({}); width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11; text: String(hand.reason || "") }
+                Label { width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10; text: "Read from today's heatmap and where rejected palms land: a right hand parks its thumb bottom-left and drops its heel bottom-right." }
+              }
+            }
+          }
+          Row {
+            width: parent.width; spacing: 10
+            Card {
+              width: parent.width * 0.5 - 5; height: 186
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 7
+                Row {
+                  width: parent.width
+                  Heading { text: "MOUSE VS TRACKPAD"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: "this week, by active time"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                }
+                Item {
+                  width: parent.width; height: 14
+                  readonly property real pad: Pulse.num(reportPage.wk.active)
+                  readonly property real mouse: Pulse.num(reportPage.wk.mouse)
+                  readonly property real share: pad + mouse > 0 ? pad / (pad + mouse) : 0.5
+                  Rectangle { anchors.fill: parent; radius: 7; color: Util.alpha(root.ink, 0.13) }
+                  Rectangle { width: parent.width * parent.share; height: parent.height; radius: 7; color: root.tint }
+                }
+                Label {
+                  readonly property real pad: Pulse.num(reportPage.wk.active)
+                  readonly property real mouse: Pulse.num(reportPage.wk.mouse)
+                  width: parent.width; font.pixelSize: 11; color: root.ink
+                  text: pad + mouse > 0 ? "Trackpad " + Pulse.pct(pad / (pad + mouse)) + " · mouse " + Pulse.pct(mouse / (pad + mouse)) + "  ·  " + Pulse.duration(pad) + " on the pad, " + Pulse.duration(mouse) + " on a mouse" : "Nothing measured yet."
+                }
+                Row {
+                  spacing: 8
+                  Label { text: "Auto-off"; anchors.verticalCenter: parent.verticalCenter; color: root.ink }
+                  Action { text: "On"; implicitWidth: 52; implicitHeight: 26; selected: root.autoOffOn; accent: root.tint; enabled: !pulseProc.running; onClicked: root.setAutoOff(true) }
+                  Action { text: "Off"; implicitWidth: 52; implicitHeight: 26; selected: !root.autoOffOn; accent: root.tint; enabled: !pulseProc.running; onClicked: root.setAutoOff(false) }
+                  Label { anchors.verticalCenter: parent.verticalCenter; font.pixelSize: 10; text: (root.snap.autoOff || {}).offNow ? "pad is off right now · a tap or a real move brings it back" : "switched off " + Pulse.int((root.snap.autoOff || {}).today) + "× today" }
+                }
+                Label { width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10; text: "Cursor motion with no finger on the pad counts as a mouse. With auto-off on, 15 s of mouse use switches the pad off and a tap or a 10 mm move switches it back on." }
+              }
+            }
+            Card {
+              width: parent.width * 0.5 - 5; height: 186
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 5
+                Row {
+                  width: parent.width
+                  Heading { text: "WHERE YOU USE IT"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: "touches by focused window, this week"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                }
+                Repeater {
+                  model: (reportPage.rp.apps || []).slice(0, 6)
+                  Row {
+                    id: appRow
+                    required property var modelData
+                    readonly property real peak: Pulse.num(((reportPage.rp.apps || [])[0] || {}).touches) || 1
+                    width: parent.width; spacing: 8; height: 18
+                    Label { text: appRow.modelData.app || "—"; width: 150; elide: Text.ElideRight; color: root.ink; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
+                    Item {
+                      width: parent.width - 150 - 8 - 150 - 8; height: parent.height
+                      Rectangle { anchors.verticalCenter: parent.verticalCenter; width: parent.width; height: 6; radius: 3; color: Util.alpha(root.ink, 0.13)
+                        Rectangle { width: parent.width * Pulse.clamp(Pulse.num(appRow.modelData.touches) / appRow.peak, 0, 1); height: parent.height; radius: 3; color: root.tint } }
+                    }
+                    Label { text: Pulse.int(appRow.modelData.touches) + " · " + Pulse.distance(appRow.modelData.distance); width: 150; horizontalAlignment: Text.AlignRight; font.pixelSize: 10; anchors.verticalCenter: parent.verticalCenter }
+                  }
+                }
+                Label { visible: (reportPage.rp.apps || []).length === 0; text: "Touches are stamped with the focused window from now on; the list fills as you work."; font.pixelSize: 10; width: parent.width; wrapMode: Text.WordWrap }
+              }
+            }
+          }
+          Card {
+            width: parent.width; height: optColumn2.implicitHeight + 28
+            Column {
+              id: optColumn2
+              anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
+              spacing: 5
+              Row {
+                width: parent.width
+                Heading { text: "OPTIMIZE HISTORY"; font.pixelSize: 12; width: parent.width / 2 }
+                Label { text: Pulse.int(reportPage.wk.palms) + " palms rejected this week" + ((reportPage.rp.palms || {}).x !== null && (reportPage.rp.palms || {}).x !== undefined ? ", landing " + ((reportPage.rp.palms || {}).x >= 0.5 ? "right" : "left") + " of centre" : ""); font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+              }
+              Repeater {
+                model: reportPage.rp.optimize || []
+                Label {
+                  required property var modelData
+                  width: optColumn2.width; font.pixelSize: 11; color: root.ink
+                  text: Qt.formatDateTime(new Date(Pulse.num(modelData.ts) * 1000), "ddd d MMM h:mm AP") + "  ·  " + String(modelData.verdict || "") + "  ·  changed " + ((modelData.changes || []).join(", ") || "nothing") + (modelData.before !== null && modelData.before !== undefined ? "  ·  corrections were " + Math.round(Pulse.num(modelData.before) * 100) + "% of long moves at the time" : "")
+                }
+              }
+              Label { visible: (reportPage.rp.optimize || []).length === 0; width: parent.width; font.pixelSize: 11; text: "No Optimize pass applied yet. Pointer feel has the button." }
+            }
+          }
+          Label { width: parent.width; font.pixelSize: 10; text: reportPage.rp.ts ? "Report built " + Pulse.ago(reportPage.rp.ts, root.now) + " · refreshes every minute while open" : (pulseProc.running ? "Building the report…" : "The report did not load. " + root.actionStatus) }
+        }
+
         // ================= TOUCH LAB =================
         Column {
           width: parent.width
@@ -2071,6 +2249,7 @@ Panel {
             Action { text: "Controls"; onClicked: { root.chooseMode = false; root.active = "controls" } }
             Action { text: "Pointer feel"; onClicked: { root.chooseMode = false; root.active = "feel" } }
             Action { text: "Gestures"; onClicked: { root.chooseMode = false; root.active = "gestures" } }
+            Action { text: "Report"; onClicked: { root.chooseMode = false; root.active = "report" } }
             Action { text: root.animated ? "Icon animation: on" : "Icon animation: off"; selected: root.animated; accent: root.tint; onClicked: root.setSetting("animated", !root.animated) }
           }
           Label { text: "The icon is the pad itself: it lights where your fingers are and dims when the pad is off.  ·  Esc closes"; font.pixelSize: 10; width: parent.width; wrapMode: Text.WordWrap }

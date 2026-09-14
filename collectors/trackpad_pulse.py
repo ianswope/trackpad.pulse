@@ -50,6 +50,12 @@ UNIT_NAME = 'trackpad-pulse.service'
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 GESTURES_LUA = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'omarchy/toggles/hypr/zz-trackpad-pulse-gestures.lua'
 HINT_INTERVAL = 600
+AUTO_OFF_MARKER = 'auto-off'
+AUTO_OFF_AFTER = 15.0      # seconds of continuous mouse motion before the pad goes off
+AUTO_OFF_MIN = 5.0         # seconds the pad stays off before a touch may bring it back
+MOUSE_GAP = 3.0            # seconds without cursor motion that end a mouse streak
+DELIBERATE_MM = 10.0       # a touch that moves this far, or a tap, is a request for the pad
+APPS_KEPT = 40
 # Where the fingers land, as a coarse grid over the pad, kept per day.
 HEAT_W, HEAT_H = 32, 20
 
@@ -241,6 +247,9 @@ class Pad:
         self.prev = None
         self.heat = [0] * (HEAT_W * HEAT_H)
         self.hours = [0] * 24
+        self.palm_x = 0.0
+        self.palm_y = 0.0
+        self.palm_n = 0
         self.counts = zero_counters()
         self.hist = [0.0] * (BINS + 1)
         self.peak = 0.0
@@ -343,9 +352,13 @@ class Pad:
             ses = self.session
             ses['max'] = max(ses['max'], fingers)
             for s in active:
-                hx = min(HEAT_W - 1, max(0, int((s['x'] - self.range_x[0]) / (self.range_x[1] - self.range_x[0]) * HEAT_W)))
-                hy = min(HEAT_H - 1, max(0, int((s['y'] - self.range_y[0]) / (self.range_y[1] - self.range_y[0]) * HEAT_H)))
-                self.heat[hy * HEAT_W + hx] += 1
+                nx = (s['x'] - self.range_x[0]) / (self.range_x[1] - self.range_x[0])
+                ny = (s['y'] - self.range_y[0]) / (self.range_y[1] - self.range_y[0])
+                self.heat[min(HEAT_H - 1, max(0, int(ny * HEAT_H))) * HEAT_W + min(HEAT_W - 1, max(0, int(nx * HEAT_W)))] += 1
+                if s['tool'] == MT_TOOL_PALM:
+                    self.palm_x += nx
+                    self.palm_y += ny
+                    self.palm_n += 1
             ses['dist'] += dist
             ses['peak'] = max(ses['peak'], speed)
             leader = self.slots.get(ses['lead'])
@@ -399,7 +412,7 @@ class Pad:
         rec = {'wall': time.time(), 'start': ses['start'], 'end': now, 'kind': kind, 'fingers': ses['max'],
                'duration': round(now - ses['start'], 3), 'dist': round(ses['dist'], 2), 'peak': round(ses['peak'], 1),
                'mean': round(ses['dist'] / max(0.01, now - ses['start']), 1),
-               'dx': round(ses['x1'] - ses['x0'], 2), 'dy': round(ses['y1'] - ses['y0'], 2), 'flag': '', 'ref': 0.0}
+               'dx': round(ses['x1'] - ses['x0'], 2), 'dy': round(ses['y1'] - ses['y0'], 2), 'flag': '', 'ref': 0.0, 'app': ses.get('app', '')}
         rec['flag'], rec['ref'] = flag_session(rec, self.prev)
         if kind == 'move' and rec['dist'] >= LONG_MOVE_MM:
             self.counts['longMoves'] += 1
@@ -430,7 +443,8 @@ class Pad:
     def take_maps(self):
         heat, self.heat = self.heat, [0] * (HEAT_W * HEAT_H)
         hours, self.hours = self.hours, [0] * 24
-        return heat, hours
+        palm, self.palm_x, self.palm_y, self.palm_n = (self.palm_x, self.palm_y, self.palm_n), 0.0, 0.0, 0
+        return heat, hours, palm
 
     def facts(self):
         f = dict(self.info)
@@ -491,6 +505,40 @@ def classify(ses, now):
             return 'pinch'
         return 'scroll' if ses['dist'] >= TAP_MM else 'move'
     return 'move'
+
+
+# ---- which hand, from where the fingers and palms land ------------------------
+def hand_verdict(heat, palm_x, palm_n):
+    """Right or left hand, with the reasons. Pure.
+
+    A right hand rests its thumb at the bottom-left of the pad and drops its
+    heel at the bottom-right; a left hand mirrors that. Two votes: where the
+    bottom-row mass sits and where rejected palms land.
+    """
+    total = float(sum(heat)) if heat else 0.0
+    if total < 200 and palm_n < 5:
+        return {'hand': 'unknown', 'confidence': 0.0, 'reason': 'Not enough touches yet to tell.'}
+    left = right = 0.0
+    for i, n in enumerate(heat or []):
+        row, col = divmod(i, HEAT_W)
+        if row >= HEAT_H * 0.6:
+            if col < HEAT_W * 0.4:
+                left += n
+            elif col >= HEAT_W * 0.6:
+                right += n
+    votes, reasons = 0.0, []
+    if left + right > 50:
+        share = (left - right) / (left + right)        # +1 all thumb-left, -1 all thumb-right
+        votes += share
+        reasons.append('%.0f%% of the bottom-row touching sits on the %s' % (max(left, right) / (left + right) * 100, 'left' if left >= right else 'right'))
+    if palm_n >= 5:
+        px = palm_x / palm_n
+        votes += (px - 0.5) * 2                          # palms right => right hand
+        reasons.append('rejected palms land %s of centre' % ('right' if px >= 0.5 else 'left'))
+    if abs(votes) < 0.15:
+        return {'hand': 'unknown', 'confidence': round(abs(votes), 2), 'reason': 'Touches are spread too evenly to say. ' + '; '.join(reasons) + '.'}
+    return {'hand': 'right' if votes > 0 else 'left', 'confidence': round(min(1.0, abs(votes)), 2),
+            'reason': ('Thumb rests left, heel falls right: a right hand. ' if votes > 0 else 'Thumb rests right, heel falls left: a left hand. ') + '; '.join(reasons) + '.'}
 
 
 # ---- access ---------------------------------------------------------------
@@ -603,6 +651,42 @@ class Cursor:
         return counts, hist
 
 
+class MouseWatch:
+    """Cursor motion while no finger is on the pad is another pointing device, called the mouse here."""
+
+    def __init__(self):
+        self.x = self.y = None
+        self.at = None
+        self.streak_start = None
+        self.last_motion = 0.0
+        self.active = 0.0
+        self.distance = 0.0
+
+    def observe(self, x, y, now, pad_touched):
+        moved = False
+        if self.x is not None and self.at is not None:
+            d = math.hypot(x - self.x, y - self.y)
+            if d > 0 and not pad_touched:
+                moved = True
+                self.distance += d
+                self.active += min(1.0, now - self.at)
+                if self.streak_start is None or now - self.last_motion > MOUSE_GAP:
+                    self.streak_start = now
+                self.last_motion = now
+        self.x, self.y, self.at = x, y, now
+        if now - self.last_motion > MOUSE_GAP:
+            self.streak_start = None
+        return moved
+
+    @property
+    def streak(self):
+        return 0.0 if self.streak_start is None else self.last_motion - self.streak_start
+
+    def take(self):
+        out, self.active, self.distance = {'active': self.active, 'distance': self.distance}, 0.0, 0.0
+        return out
+
+
 # ---- persistence ----------------------------------------------------------
 def db_open():
     db = sqlite3.connect(STATE / 'history.sqlite3', timeout=5)
@@ -615,16 +699,61 @@ def db_open():
     # One row per calendar day, kept forever: a year is 365 short rows.
     db.execute('CREATE TABLE IF NOT EXISTS days (day TEXT PRIMARY KEY, touches INTEGER, taps INTEGER, clicks INTEGER, moves INTEGER, '
                'scrolls INTEGER, gestures INTEGER, palms INTEGER, distance REAL, scroll REAL, active REAL, moving REAL, peak REAL)')
+    for column, kind in (('mouse', 'REAL DEFAULT 0'), ('apps', 'TEXT')):
+        try:
+            db.execute('ALTER TABLE days ADD COLUMN %s %s' % (column, kind))
+        except sqlite3.OperationalError:
+            pass
     return db
 
 
 def record_day(db, today):
     c = today['counts']
-    db.execute('INSERT OR REPLACE INTO days VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    db.execute('INSERT OR REPLACE INTO days VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                (today['day'], c['touches'], c['taps'] + c['taps2'] + c['taps3'], c['clicks'] + c['rightClicks'], c['moves'], c['scrolls'],
                 c['pinches'] + c['swipes3'] + c['swipes4'], c['palms'], round(c['distance'], 1), round(c['scroll'], 1),
-                round(c['active'], 1), round(c['moving'], 1), round(today.get('peak', 0.0), 1)))
+                round(c['active'], 1), round(c['moving'], 1), round(today.get('peak', 0.0), 1),
+                round((today.get('mouse') or {}).get('active', 0.0), 1), json.dumps(today.get('apps') or {})))
     db.commit()
+
+
+def report(db, today, log, now):
+    """The week, put together: totals against last week, a bar per day, apps, hand, mouse share, what Optimize did."""
+    def rows(since, until):
+        return db.execute('SELECT day, touches, taps, clicks, distance, active, mouse, peak, gestures, palms, apps FROM days WHERE day >= ? AND day < ? ORDER BY day',
+                          (since, until)).fetchall()
+    week = rows(day_key(now - 6 * 86400), today['day']) + [(today['day'], today['counts']['touches'],
+            today['counts']['taps'] + today['counts']['taps2'] + today['counts']['taps3'], today['counts']['clicks'] + today['counts']['rightClicks'],
+            today['counts']['distance'], today['counts']['active'], (today.get('mouse') or {}).get('active', 0.0), today.get('peak', 0.0),
+            today['counts']['pinches'] + today['counts']['swipes3'] + today['counts']['swipes4'], today['counts']['palms'], json.dumps(today.get('apps') or {}))]
+    last = rows(day_key(now - 13 * 86400), day_key(now - 6 * 86400))
+
+    def total(rs, i):
+        return sum((r[i] or 0) for r in rs)
+    apps = {}
+    for r in week:
+        try:
+            for name, a in json.loads(r[10] or '{}').items():
+                slot = apps.setdefault(name, {'touches': 0, 'distance': 0.0, 'active': 0.0})
+                for key in slot:
+                    slot[key] += a.get(key, 0)
+        except (ValueError, AttributeError):
+            pass
+    top = sorted(apps.items(), key=lambda kv: kv[1]['touches'], reverse=True)[:8]
+    busiest = max(week, key=lambda r: r[1] or 0) if week else None
+    heat = today.get('heat') or []
+    hand = hand_verdict(heat, today.get('palmX', 0.0), today.get('palmN', 0))
+    return {'ts': now, 'days': [{'day': r[0], 'touches': r[1] or 0, 'taps': r[2] or 0, 'clicks': r[3] or 0, 'distance': round(r[4] or 0, 1),
+                                 'active': round(r[5] or 0, 1), 'mouse': round(r[6] or 0, 1), 'peak': round(r[7] or 0, 1), 'gestures': r[8] or 0, 'palms': r[9] or 0} for r in week],
+            'week': {'distance': total(week, 4), 'touches': total(week, 1), 'taps': total(week, 2), 'clicks': total(week, 3), 'active': total(week, 5),
+                     'mouse': total(week, 6), 'gestures': total(week, 8), 'palms': total(week, 9), 'peak': max((r[7] or 0) for r in week) if week else 0, 'days': len(week)},
+            'lastWeek': {'distance': total(last, 4), 'touches': total(last, 1), 'clicks': total(last, 3), 'active': total(last, 5), 'days': len(last)},
+            'busiestDay': busiest[0] if busiest else '', 'busiestHour': max(range(24), key=lambda h: (today.get('hours') or [0] * 24)[h]) if today.get('hours') else None,
+            'apps': [{'app': name, **vals} for name, vals in top], 'hand': hand,
+            'palms': {'today': today['counts']['palms'], 'x': round(today.get('palmX', 0.0) / max(1, today.get('palmN', 0)), 2) if today.get('palmN') else None},
+            'autoOff': {'today': today.get('autoOff', 0)},
+            'optimize': [{'ts': e['ts'], 'changes': [c.get('label', c.get('key')) for c in e.get('changes', [])], 'before': (e.get('evidence') or {}).get('correctionRate'),
+                          'verdict': e.get('verdict', '')} for e in (log or []) if e.get('applied')][-5:]}
 
 
 WINDOW_KEYS = ('distance', 'touches', 'taps', 'clicks', 'active')
@@ -746,6 +875,12 @@ class Recorder:
         self.pending_sessions = []
         self.last_hint = time.time() - HINT_INTERVAL + 60
         self.recent = deque()   # (bucketStart, counts) ten-second buckets for the trailing minute
+        self.mouse = MouseWatch()
+        self.last_cursor = 0.0
+        self.pad_off_by_us = False
+        self.pad_off_at = 0.0
+        self.auto_off_checked = 0.0
+        self.auto_off_wanted = False
 
     def _load_today(self):
         fresh = self._fresh_today(time.time())
@@ -755,7 +890,7 @@ class Recorder:
                 # Merge over a fresh record: a release that adds a counter must
                 # not choke on the file the previous release wrote.
                 fresh['counts'].update({k: saved['counts'].get(k, 0) for k in COUNTERS})
-                for key in ('hist', 'peak', 'peakAt', 'lastTouch', 'heat', 'hours'):
+                for key in ('hist', 'peak', 'peakAt', 'lastTouch', 'heat', 'hours', 'palmX', 'palmY', 'palmN', 'apps', 'mouse', 'autoOff'):
                     if key in saved:
                         fresh[key] = saved[key]
                 if len(fresh.get('heat') or []) != HEAT_W * HEAT_H:
@@ -772,7 +907,8 @@ class Recorder:
 
     def _fresh_today(self, ts):
         return {'day': day_key(ts), 'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'peakAt': 0.0, 'lastTouch': 0.0,
-                'heat': [0] * (HEAT_W * HEAT_H), 'hours': [0] * 24,
+                'heat': [0] * (HEAT_W * HEAT_H), 'hours': [0] * 24, 'palmX': 0.0, 'palmY': 0.0, 'palmN': 0, 'apps': {},
+                'mouse': {'active': 0.0, 'distance': 0.0}, 'autoOff': 0,
                 'cursor': {'distance': 0.0, 'active': 0.0, 'moving': 0.0, 'peak': 0.0, 'peakAt': 0.0, 'hist': [0.0] * (BINS + 1)}}
 
     @property
@@ -838,16 +974,27 @@ class Recorder:
             if not pad.dirty:
                 continue
             pad.dirty = False
-            if pad.sessions:
-                self.pending_sessions.extend(pad.sessions)
-                pad.sessions = []
-            heat, hours = pad.take_maps()
+            finished, pad.sessions = pad.sessions, []
+            self.pending_sessions.extend(finished)
+            heat, hours, palm = pad.take_maps()
             for i, n in enumerate(heat):
                 if n:
                     self.today['heat'][i] += n
             for i, n in enumerate(hours):
                 if n:
                     self.today['hours'][i] += n
+            self.today['palmX'] += palm[0]
+            self.today['palmY'] += palm[1]
+            self.today['palmN'] += palm[2]
+            for rec in finished:
+                if rec.get('app'):
+                    slot = self.today['apps'].setdefault(rec['app'], {'touches': 0, 'distance': 0.0, 'active': 0.0})
+                    slot['touches'] += 1
+                    slot['distance'] += rec['dist']
+                    slot['active'] += rec['duration']
+            if len(self.today['apps']) > APPS_KEPT:
+                keep = sorted(self.today['apps'].items(), key=lambda kv: kv[1]['touches'], reverse=True)[:APPS_KEPT]
+                self.today['apps'] = dict(keep)
             counts, hist = pad.take()
             bucket = int(now // 10) * 10
             if not self.recent or self.recent[-1][0] != bucket:
@@ -891,6 +1038,9 @@ class Recorder:
             if counts['frames'] or counts['distance'] > 0 or counts['touches']:
                 record(self.db, self.minute['start'], counts, self.minute['hist'], self.access)
             self.minute = {'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'start': now}
+            taken = self.mouse.take()
+            self.today['mouse']['active'] += taken['active']
+            self.today['mouse']['distance'] += taken['distance']
             record_day(self.db, self.today)
             atomic(STATE, 'history.json', {str(s): history(self.db, s, now) for s in (3600, 86400, 604800)})
             self.last_history = now
@@ -903,6 +1053,85 @@ class Recorder:
 
     def touching(self):
         return any(pad.fingers for _, pad in self.pads.values())
+
+    def active_window_class(self):
+        path = self.cursor.path or self.cursor.socket_path()
+        if not path:
+            return ''
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(0.3)
+                s.connect(path)
+                s.sendall(b'activewindow')
+                reply = s.recv(4096).decode(errors='replace')
+        except (OSError, ValueError):
+            return ''
+        for line in reply.splitlines():
+            if line.strip().startswith('class:'):
+                return line.split(':', 1)[1].strip()[:48]
+        return ''
+
+    def name_sessions(self):
+        """Stamp each new touch session with the window that had focus when it began."""
+        for _, pad in self.pads.values():
+            if pad.session is not None and 'app' not in pad.session:
+                pad.session['app'] = self.active_window_class()
+
+    def watch_mouse(self, now):
+        """Five times a second, twenty while it moves: is another pointing device driving the cursor?"""
+        if not self.pads:
+            return
+        interval = 0.05 if now - self.mouse.last_motion < 2.0 else 0.2
+        if now - self.last_cursor < interval:
+            return
+        self.last_cursor = now
+        if not self.cursor.poll(now):
+            return
+        touched = self.touching() or now - max([pad.last_touch for _, pad in self.pads.values()] or [0.0]) < 0.3
+        self.mouse.observe(self.cursor.x, self.cursor.y, now, touched)
+
+    def set_pad(self, enabled):
+        try:
+            current = current_settings()
+            result = subprocess.run([sys.executable, str(PLUGIN_ROOT / 'trackpads.py'), 'set', str(current['device']), 'enabled', json.dumps(bool(enabled))],
+                                    capture_output=True, text=True, timeout=15, check=False)
+            return result.returncode == 0
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:
+            print('Trackpad Pulse: set_pad: ' + str(e), flush=True)
+            return False
+
+    def auto_off(self, now):
+        """Opt-in: the pad goes off after a stretch of mouse use, and comes back on a deliberate touch.
+
+        The kernel keeps reporting the pad while Hyprland ignores it, so the
+        recorder sees the touch that asks for it back. A resting finger or a
+        palm is not a request: it takes a tap, or a move of DELIBERATE_MM.
+        """
+        if now - self.auto_off_checked >= 2.0:
+            self.auto_off_checked = now
+            self.auto_off_wanted = (STATE / AUTO_OFF_MARKER).exists()
+        if not self.auto_off_wanted:
+            if self.pad_off_by_us:
+                self.pad_off_by_us = not self.set_pad(True)
+            return
+        if not self.pad_off_by_us:
+            if self.mouse.streak >= AUTO_OFF_AFTER and not self.touching() and self.set_pad(False):
+                self.pad_off_by_us = True
+                self.pad_off_at = now
+                self.today['autoOff'] = self.today.get('autoOff', 0) + 1
+                print('Trackpad Pulse: pad off after %.0f s of mouse use' % self.mouse.streak, flush=True)
+            return
+        if now - self.pad_off_at < AUTO_OFF_MIN:
+            return
+        for _, pad in self.pads.values():
+            asked = any(r['kind'] == 'tap' or (r['kind'] == 'move' and r['dist'] >= DELIBERATE_MM) for r in pad.sessions if r['wall'] >= self.pad_off_at)
+            asked = asked or (pad.session is not None and pad.session.get('dist', 0.0) >= DELIBERATE_MM)
+            if asked:
+                if self.set_pad(True):
+                    self.pad_off_by_us = False
+                    self.mouse.streak_start = None
+                    print('Trackpad Pulse: pad back on, deliberate touch', flush=True)
+                return
 
     def write_live(self, now):
         pads = []
@@ -925,8 +1154,12 @@ class Recorder:
             spans = windows(self.db, self.today, now, self.recent)
         except sqlite3.Error:
             spans = {}
+        mouse_live = {'active': self.today['mouse']['active'] + self.mouse.active, 'distance': self.today['mouse']['distance'] + self.mouse.distance,
+                      'streak': round(self.mouse.streak, 1)}
         return {'ts': now, 'warm': True, 'access': self.access, 'inputGroup': in_input_group(), 'udevRule': udev_rule_present(), 'windows': spans,
-                'heatW': HEAT_W, 'heatH': HEAT_H,
+                'heatW': HEAT_W, 'heatH': HEAT_H, 'mouse': mouse_live,
+                'autoOff': {'enabled': self.auto_off_wanted, 'offNow': self.pad_off_by_us, 'today': self.today.get('autoOff', 0)},
+                'hand': hand_verdict(self.today.get('heat') or [], self.today.get('palmX', 0.0), self.today.get('palmN', 0)),
                 'udevRulePath': str(UDEV_RULE_PATH), 'pads': pads, 'today': self.today, 'week': week,
                 'binMmS': BIN_MM_S, 'bins': BINS, 'mmPerUnitMs': MM_PER_UNIT_MS, 'pid': os.getpid(),
                 'cursorSocket': bool(self.cursor.path), 'lastTouch': max([pad.last_touch for _, pad in self.pads.values()] + [self.today.get('lastTouch', 0.0)])}
@@ -956,7 +1189,10 @@ class Recorder:
                     self.cursor.poll(now)
                     time.sleep(0.05 if moving else 0.2)
                 now = time.time()
+                self.name_sessions()
+                self.watch_mouse(now)
                 self.gather(now)
+                self.auto_off(now)
                 if self.touching():
                     if now - self.last_live >= LIVE_INTERVAL:
                         self.write_live(now)
@@ -1498,7 +1734,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
                                            'optimize', 'optimize-applied', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
-                                           'theme-next', 'theme-prev', 'theme-random'])
+                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
     args = parser.parse_args()
@@ -1524,6 +1760,23 @@ def main():
             value = json.loads((STATE / 'hint.json').read_text())
         elif args.action == 'gestures-catalogue':
             value = gesture_catalogue()
+        elif args.action == 'report':
+            today = Recorder._fresh_today(None, time.time())
+            try:
+                saved = json.loads((STATE / 'today.json').read_text())
+                if saved.get('day') == today['day']:
+                    today.update(saved)
+            except (OSError, ValueError):
+                pass
+            value = report(db_open(), today, load_log(), time.time())
+        elif args.action in ('auto-off-on', 'auto-off-off'):
+            marker = STATE / AUTO_OFF_MARKER
+            if args.action == 'auto-off-on':
+                marker.touch()
+                value = {'message': 'Auto-off is on: the pad goes off after 15 s of mouse use and comes back on a tap or a real move.'}
+            else:
+                marker.unlink(missing_ok=True)
+                value = {'message': 'Auto-off is off. If the pad was off, the recorder switches it back on within two seconds.'}
         elif args.action == 'gestures-remove':
             value = gestures_remove()
         elif args.action.startswith('theme-'):

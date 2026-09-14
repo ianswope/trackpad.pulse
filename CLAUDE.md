@@ -114,6 +114,19 @@ that. The daemon's loop survives a bad tick now, but the journal
 (`journalctl --user -u trackpad-pulse.service`) is the first place to look
 when numbers stop moving.
 
+## Report, hand, mouse, auto-off
+
+`report` builds the week from the `days` table (which also keeps `mouse`
+seconds and an `apps` JSON per day) plus `today.json` and the optimize log.
+`hand_verdict` is pure: bottom-row heat mass left vs right, and the palm
+centroid, vote. `MouseWatch` counts cursor motion with no finger on the pad
+as a mouse; it polls the Hyprland socket at 5 Hz, 20 Hz while moving.
+Auto-off is opt-in via the `auto-off` marker file in the state dir: after
+`AUTO_OFF_AFTER` seconds of mouse streak the recorder runs
+`trackpads.py set <device> enabled false`, and a tap or a `DELIBERATE_MM` move
+seen on the still-reporting evdev node runs `enabled true`. Turning the
+setting off restores the pad within a tick. Never make this default-on.
+
 ## Gestures
 
 Hyprland's own: `hl.gesture({ fingers, direction, action })` with directions

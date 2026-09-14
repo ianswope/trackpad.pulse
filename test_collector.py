@@ -467,12 +467,13 @@ class DataFeatureTests(unittest.TestCase):
         f.down(4010 // 2, 2468 // 2, 100.0); sync(p, 100.0, True)
         f.move(4010 // 2 + 3, 2468 // 2, 100.05); sync(p, 100.05)
         f.up(100.1); sync(p, 100.1, False)
-        heat, hours = p.take_maps()
+        heat, hours, palm = p.take_maps()
         self.assertEqual(len(heat), tp.HEAT_W * tp.HEAT_H)
         self.assertEqual(sum(heat), 2, 'one cell per active finger per frame')
         self.assertEqual(heat[(tp.HEAT_H // 2) * tp.HEAT_W + tp.HEAT_W // 2], 2)
         self.assertEqual(sum(hours), 1, 'one session, one hour bucket')
-        self.assertEqual(sum(p.take_maps()[0]), 0, 'taken maps reset')
+        self.assertEqual(sum(p.take_maps()[0]), 0, "taken maps reset")
+        self.assertEqual(palm, (0.0, 0.0, 0))
 
     def test_days_table_and_windows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -551,6 +552,57 @@ class GestureTests(unittest.TestCase):
         b = tp.hint_signature([{'key': 'end', 'to': 3.15, 'reason': 'y'}, {'key': 'start', 'to': 0.59}])
         self.assertEqual(a, b)
         self.assertNotEqual(a, tp.hint_signature([{'key': 'start', 'to': 0.6}]))
+
+
+class HandMouseReportTests(unittest.TestCase):
+    def test_hand_verdict_reads_thumb_and_palm_sides(self):
+        heat = [0] * (tp.HEAT_W * tp.HEAT_H)
+        for row in range(int(tp.HEAT_H * 0.6), tp.HEAT_H):
+            for col in range(0, int(tp.HEAT_W * 0.3)):
+                heat[row * tp.HEAT_W + col] = 20          # thumb parked bottom-left
+        right = tp.hand_verdict(heat, palm_x=0.85 * 12, palm_n=12)
+        self.assertEqual(right['hand'], 'right')
+        self.assertGreater(right['confidence'], 0.5)
+        mirrored = heat[::-1]
+        left = tp.hand_verdict(mirrored, palm_x=0.15 * 12, palm_n=12)
+        self.assertEqual(left['hand'], 'left')
+        self.assertEqual(tp.hand_verdict([0] * (tp.HEAT_W * tp.HEAT_H), 0.0, 0)['hand'], 'unknown')
+
+    def test_mouse_watch_attributes_only_untouched_motion_and_tracks_streaks(self):
+        m = tp.MouseWatch()
+        self.assertFalse(m.observe(100, 100, 10.0, False))
+        self.assertTrue(m.observe(110, 100, 10.2, False))
+        self.assertFalse(m.observe(120, 100, 10.4, True), 'motion while a finger is down is the pad, not a mouse')
+        for i in range(1, 80):
+            m.observe(120 + i, 100, 10.4 + i * 0.2, False)
+        self.assertGreater(m.streak, 15.0)
+        self.assertAlmostEqual(m.take()['distance'], 10.0 + 79.0, places=6)
+        m.observe(300, 100, 40.0, False)   # 13 s of silence ends the streak
+        self.assertLess(m.streak, 1.0)
+
+    def test_report_totals_days_apps_and_optimize_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            db = tp.db_open()
+            now = 1_700_000_000.0
+            for back in range(1, 10):
+                past = tp.Recorder._fresh_today(None, now - back * 86400)
+                past['counts']['touches'] = 100; past['counts']['distance'] = 1000.0; past['counts']['clicks'] = 5
+                past['apps'] = {'brave': {'touches': 60, 'distance': 600.0, 'active': 30.0}, 'kitty': {'touches': 40, 'distance': 400.0, 'active': 20.0}}
+                past['mouse'] = {'active': 120.0, 'distance': 5000.0}
+                tp.record_day(db, past)
+            today = tp.Recorder._fresh_today(None, now)
+            today['counts']['touches'] = 7; today['apps'] = {'kitty': {'touches': 7, 'distance': 70.0, 'active': 3.0}}
+            log = [{'ts': now - 3 * 86400, 'applied': True, 'changes': [{'key': 'start', 'label': 'Start'}], 'evidence': {'correctionRate': 0.2}, 'verdict': 'fit'}]
+            r = tp.report(db, today, log, now)
+            self.assertEqual(r['week']['days'], 7)
+            self.assertEqual(r['week']['touches'], 607)
+            self.assertEqual(r['lastWeek']['touches'], 300)
+            self.assertEqual(r['apps'][0]['app'], 'brave')
+            self.assertEqual(r['apps'][1]['touches'], 247)
+            self.assertEqual(r['week']['mouse'], 720.0)
+            self.assertEqual(r['optimize'][0]['changes'], ['Start'])
+            self.assertEqual(r['days'][-1]['day'], today['day'])
 
 
 if __name__ == '__main__':

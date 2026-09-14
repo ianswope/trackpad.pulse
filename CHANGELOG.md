@@ -2,6 +2,14 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.3.0 — 2026-09-14
+
+- **Report page.** This week against last: distance, touches, clicks, active time, a bar per day, the busiest day and hour, palms rejected, and the last Optimize passes with what they changed.
+- **Your hand.** Right or left, read from today's heatmap and where rejected palms land, with the reasons and a confidence.
+- **Mouse vs trackpad.** Cursor motion with no finger on the pad is counted as a mouse; the Report shows the share of active time. **Auto-off**, opt-in: after 15 s of continuous mouse use the pad is switched off through Trackpad Plus's own per-device setting, and a tap or a 10 mm move on the pad switches it back on, because the kernel keeps reporting the pad while Hyprland ignores it. Never on by default.
+- **Where you use it.** Each touch session is stamped with the focused window's class over the Hyprland socket; the Report lists the top windows by touches and distance for the week. The day table now keeps apps and mouse time.
+- Recorder: `report`, `auto-off-on`, `auto-off-off` actions; `hand` and `mouse` in the snapshot. IPC: `report`.
+
 ## 1.2.0 — 2026-09-14
 
 - **Gestures.** A new page assigns an action to every three- and four-finger swipe and pinch from a catalogue of 56: workspace slide, next and previous workspace, scratchpad, fullscreen, close, float, move, resize, focus in four directions, next, previous, random and picked **themes**, next and picked **backgrounds**, night light, the Omarchy menu, emoji, clipboard, keybindings, screenshots, recording, lock, screensaver, bar, do-not-disturb, terminal, browser, files, volume, mute, mic, audio output, brightness, media transport where playerctl exists, cursor zoom for pinches, and Trackpad Pulse itself. The panel writes one Lua file of `hl.gesture` lines into Omarchy's toggles through Trackpad Plus's hardened writer and asks Hyprland to reload. Suggested defaults are shown first and applied only on request.

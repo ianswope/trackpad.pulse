@@ -110,6 +110,14 @@ Pick an action and it is live at once: the panel sends slot and action ids to th
 
 Distance travelled, touches, taps, clicks and active time over the trailing minute, the last hour, today, this week, this month, this year and all time. Seven cards on the Overview, the full table in the Touch lab with touches per hour of active use. Days are kept forever in a table of one row each, so "all time" means all time.
 
+## Report
+
+This week against last: distance, touches, clicks and active time, a bar per day, busiest day and hour, palms rejected, and every Optimize pass with what it changed. Three readings only a week of data can give:
+
+- **Your hand.** A right hand parks its thumb bottom-left and drops its heel bottom-right; a left hand mirrors it. The heatmap and the rejected palms vote, and the verdict comes with its reasons and a confidence.
+- **Mouse vs trackpad.** Cursor motion with no finger on the pad is a mouse. The share of your active time on each, and an opt-in **auto-off**: after 15 seconds of mouse use the pad is switched off through Trackpad Plus's own per-device setting, and a tap or a real move on the pad switches it straight back on. The kernel keeps reporting the pad while Hyprland ignores it, which is what makes the way back possible.
+- **Where you use it.** Every touch is stamped with the focused window, so the week's top windows by touches and distance are on the page.
+
 ## Where you touch
 
 The Touch lab draws a heatmap of where your fingers land on the pad, per day, at the pad's real proportions, beside a bar for every hour of the day. A thumb parked in a corner, a palm zone the firmware keeps rejecting, the hour you actually work: all visible.
