@@ -460,5 +460,98 @@ class OptimizerTests(unittest.TestCase):
             self.assertIsNotNone(out['previous'])
 
 
+class DataFeatureTests(unittest.TestCase):
+    def test_heat_and_hours_accumulate_per_finger_frame(self):
+        p = pad()
+        f = Finger(p, 0, 1)
+        f.down(4010 // 2, 2468 // 2, 100.0); sync(p, 100.0, True)
+        f.move(4010 // 2 + 3, 2468 // 2, 100.05); sync(p, 100.05)
+        f.up(100.1); sync(p, 100.1, False)
+        heat, hours = p.take_maps()
+        self.assertEqual(len(heat), tp.HEAT_W * tp.HEAT_H)
+        self.assertEqual(sum(heat), 2, 'one cell per active finger per frame')
+        self.assertEqual(heat[(tp.HEAT_H // 2) * tp.HEAT_W + tp.HEAT_W // 2], 2)
+        self.assertEqual(sum(hours), 1, 'one session, one hour bucket')
+        self.assertEqual(sum(p.take_maps()[0]), 0, 'taken maps reset')
+
+    def test_days_table_and_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            db = tp.db_open()
+            now = 1_700_000_000.0
+            today = tp.Recorder._fresh_today(None, now)
+            today['counts']['distance'] = 500.0; today['counts']['touches'] = 5; today['counts']['active'] = 30.0
+            for back in (1, 2, 10, 40):
+                past = tp.Recorder._fresh_today(None, now - back * 86400)
+                past['counts']['distance'] = 1000.0 * back; past['counts']['touches'] = 10 * back; past['counts']['active'] = 60.0
+                tp.record_day(db, past)
+            tp.record_day(db, today)
+            for minute in range(3):
+                tp.record(db, now - 600 - minute * 60, dict(tp.zero_counters(), touches=1, distance=100.0, active=5.0), [0.0] * (tp.BINS + 1), 'evdev')
+            recent = [(now - 65, dict(tp.zero_counters(), touches=9)), (now - 30, dict(tp.zero_counters(), touches=2, clicks=1, distance=40.0)), (now - 5, dict(tp.zero_counters(), taps=1))]
+            w = tp.windows(db, today, now, recent)
+            self.assertEqual(w['minute'], {'distance': 40.0, 'touches': 2, 'taps': 1, 'clicks': 1, 'active': 0.0}, 'the trailing minute drops the 65 s old bucket')
+            self.assertEqual(w['year']['distance'], w['all']['distance'])
+            self.assertEqual(w['hour']['distance'], 300.0)
+            self.assertEqual(w['today']['distance'], 500.0)
+            self.assertEqual(w['week']['distance'], 500.0 + 1000.0 + 2000.0)
+            self.assertEqual(w['month']['distance'], 500.0 + 1000.0 + 2000.0 + 10000.0)
+            self.assertEqual(w['all']['distance'], 500.0 + 1000.0 + 2000.0 + 10000.0 + 40000.0)
+            self.assertEqual(w['all']['days'], 5)
+            self.assertEqual(w['firstDay'], tp.day_key(now - 40 * 86400))
+
+
+class GestureTests(unittest.TestCase):
+    def test_pair_actions_own_their_axis_and_unknowns_are_refused(self):
+        clean = tp.normalize_gestures({'3-left': 'ws-slide', '4-up': 'bg-next'})
+        self.assertEqual(clean['3-right'], 'ws-slide', 'the partner direction mirrors a pair action')
+        self.assertEqual(clean['4-up'], 'bg-next')
+        self.assertEqual(clean['4-down'], 'none')
+        with self.assertRaises(RuntimeError):
+            tp.normalize_gestures({'5-left': 'ws-slide'})
+        with self.assertRaises(RuntimeError):
+            tp.normalize_gestures({'3-left': 'rm -rf /'})
+        with self.assertRaises(RuntimeError):
+            tp.normalize_gestures(['3-left'])
+
+    def test_lua_emits_each_axis_once_and_quotes_commands(self):
+        lua = tp.gestures_lua(tp.normalize_gestures({'3-left': 'ws-slide', '3-right': 'ws-slide', '4-up': 'bg-next', '3-down': 'ws-scratch', '4-pinchout': 'zoom'}))
+        self.assertEqual(lua.count('direction = "horizontal", action = "workspace"'), 1)
+        self.assertNotIn('direction = "left"', lua)
+        self.assertIn('hl.gesture({ fingers = 4, direction = "up", action = function() hl.exec_cmd("omarchy-theme-bg-next") end })', lua)
+        self.assertIn('action = "special", workspace_name = "scratchpad"', lua)
+        self.assertIn('action = "cursor_zoom", zoom_level = 2', lua)
+        self.assertTrue(lua.startswith('do -- Managed by nixfred.trackpad-pulse'))
+        self.assertTrue(lua.endswith('end\n'))
+        self.assertEqual(tp.gestures_lua(tp.normalize_gestures({})).count('hl.gesture'), 0)
+        self.assertEqual(tp.lua_quote('say "hi" \\ there'), '"say \\"hi\\" \\\\ there"')
+
+    def test_every_catalogue_action_renders(self):
+        for action in tp.CATALOGUE:
+            lua = tp.gestures_lua(tp.normalize_gestures({'3-up': action['id']}))
+            if action['id'] != 'none':
+                self.assertIn('hl.gesture({ fingers = 3', lua, action['id'])
+        catalogue = tp.gesture_catalogue()
+        self.assertEqual(len(catalogue['actions']), len(tp.CATALOGUE))
+        self.assertEqual(set(catalogue['defaults']), set(tp.SLOTS))
+        self.assertTrue(all(a['group'] and a['label'] and a['hint'] for a in catalogue['actions']))
+
+    def test_theme_step_is_cyclic_and_random_avoids_current(self):
+        names = ['A', 'B', 'C']
+        self.assertEqual(tp.pick_theme(names, 'C', 'next'), 'A')
+        self.assertEqual(tp.pick_theme(names, 'A', 'prev'), 'C')
+        self.assertEqual(tp.pick_theme(names, 'Unknown', 'next'), 'A')
+        for _ in range(20):
+            self.assertNotEqual(tp.pick_theme(names, 'B', 'random'), 'B')
+        with self.assertRaises(RuntimeError):
+            tp.pick_theme([], 'A', 'next')
+
+    def test_hint_signature_depends_only_on_keys_and_targets(self):
+        a = tp.hint_signature([{'key': 'start', 'to': 0.59, 'from': 0.8, 'reason': 'x'}, {'key': 'end', 'to': 3.15}])
+        b = tp.hint_signature([{'key': 'end', 'to': 3.15, 'reason': 'y'}, {'key': 'start', 'to': 0.59}])
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, tp.hint_signature([{'key': 'start', 'to': 0.6}]))
+
+
 if __name__ == '__main__':
     unittest.main()

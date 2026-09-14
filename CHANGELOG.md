@@ -2,6 +2,16 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.2.0 — 2026-09-14
+
+- **Gestures.** A new page assigns an action to every three- and four-finger swipe and pinch from a catalogue of 56: workspace slide, next and previous workspace, scratchpad, fullscreen, close, float, move, resize, focus in four directions, next, previous, random and picked **themes**, next and picked **backgrounds**, night light, the Omarchy menu, emoji, clipboard, keybindings, screenshots, recording, lock, screensaver, bar, do-not-disturb, terminal, browser, files, volume, mute, mic, audio output, brightness, media transport where playerctl exists, cursor zoom for pinches, and Trackpad Pulse itself. The panel writes one Lua file of `hl.gesture` lines into Omarchy's toggles through Trackpad Plus's hardened writer and asks Hyprland to reload. Suggested defaults are shown first and applied only on request.
+- **Every clock.** Distance, touches, taps, clicks and active time over the trailing minute, the last hour, today, this week, this month, this year and all time. A per-day table is kept forever. Seven cards on the Overview, the full table in the Touch lab with touches per active hour.
+- **Where you touch.** A per-day heatmap of finger positions over the pad, and touches per hour of the day, both in the Touch lab.
+- **The standing check.** Every ten minutes the recorder re-runs the optimizer against the settings in use. When a proposal with real changes and at least medium confidence appears that you have not seen, the Optimize button and the Pointer feel tab light up and the Overview carries a one-line banner with Review and Later. Applying, dismissing or Later marks it seen until the proposal changes.
+- Fix: the recorder crash-looped after 1.1.0 on a `today.json` written by 1.0.0, so counts and the live finger map froze. A missing counter is now merged in, and one bad tick can no longer stop the recording.
+- Recorder: `hint`, `gestures-catalogue`, `gestures-apply`, `gestures-remove`, `theme-next`, `theme-prev`, `theme-random` actions; `days` table; ten-second buckets for the trailing minute.
+- IPC: `gestures` opens the Gestures page.
+
 ## 1.1.0 — 2026-09-14
 
 **Optimize for my hand.** The recorder now keeps one row per touch session for seven days and names the two fingerprints of a wrong curve as sessions end: an **overshoot correction** (a long move answered at once by a short move back) and a **re-stroke** (a long move continued at once in the same direction), plus their scroll equivalents.

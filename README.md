@@ -80,6 +80,40 @@ Every change comes with its reason and the numbers behind it. Nothing changes un
 
 It cannot tune taps, natural scrolling or the right-click switch; those are preferences with no signal in the touch stream.
 
+**It keeps watching.** Every ten minutes the recorder re-runs the same optimizer against the settings you actually have. When a proposal with real changes and at least medium confidence turns up that you have not seen, the Optimize button and the Pointer feel tab light up and the Overview carries a one-line banner with **Review** and **Later**. Nothing is applied for you.
+
+---
+
+## Gestures
+
+<div align="center">
+<img src="assets/screenshots/gestures.png" width="900" alt="Gestures: three- and four-finger swipes and pinches, each with a searchable action dropdown, a suggested set and a live-in-Hyprland banner">
+</div>
+
+Every three- and four-finger swipe and pinch Hyprland offers, each with a searchable dropdown of 56 actions grouped by what they do:
+
+| Group | Actions |
+|---|---|
+| **Workspaces** | slide between workspaces (1:1, animated), next, previous, last used, scratchpad, layout toggle, scroll the tape |
+| **Windows** | fullscreen, maximize, close, float, move, resize, focus left/right/up/down, gaps, transparency |
+| **Themes & backgrounds** | next, previous, random and picked theme; next and picked background; night light |
+| **Omarchy** | menu, emoji, clipboard, keybindings, screenshot region or screen, recording, lock, screensaver, bar, do not disturb, terminal, browser, files |
+| **Media & audio** | volume up, down, mute, mic mute, switch output, brightness, play/pause and tracks where `playerctl` is installed |
+| **Zoom** | cursor zoom ×2, or live with the pinch |
+| **Trackpad Pulse** | open the dashboard, Optimize for my hand, trackpad off |
+
+Pick an action and it is live at once: the panel sends slot and action ids to the recorder, the recorder writes one Lua file of `hl.gesture` lines into `~/.local/state/omarchy/toggles/hypr/` through Trackpad Plus's hardened writer, and asks Hyprland to reload. Actions that follow your fingers (slide, move, resize, scroll the tape) own both directions of their axis. The suggested set is shown first and only applied when you say so: three fingers slide workspaces, swipe up for fullscreen, down for the scratchpad; four fingers step through themes left and right, change the background up, open the menu down, and pinch out to zoom.
+
+---
+
+## Every clock
+
+Distance travelled, touches, taps, clicks and active time over the trailing minute, the last hour, today, this week, this month, this year and all time. Seven cards on the Overview, the full table in the Touch lab with touches per hour of active use. Days are kept forever in a table of one row each, so "all time" means all time.
+
+## Where you touch
+
+The Touch lab draws a heatmap of where your fingers land on the pad, per day, at the pad's real proportions, beside a bar for every hour of the day. A thumb parked in a corner, a palm zone the firmware keeps rejecting, the hour you actually work: all visible.
+
 ---
 
 ## Controls
@@ -157,6 +191,7 @@ omarchy-shell nixfred.trackpad-pulse close
 omarchy-shell nixfred.trackpad-pulse toggle
 omarchy-shell nixfred.trackpad-pulse chooser     # what right-click opens
 omarchy-shell nixfred.trackpad-pulse page feel   # overview · controls · feel · lab · about
+omarchy-shell nixfred.trackpad-pulse gestures    # the Gestures page
 omarchy-shell nixfred.trackpad-pulse enable false  # the pad off; true puts it back
 omarchy-shell nixfred.trackpad-pulse status      # JSON: device, access, today's counts, panel size
 ```

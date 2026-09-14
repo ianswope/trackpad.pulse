@@ -19,6 +19,9 @@ Files
 """
 import argparse
 import array
+import hashlib
+import random
+import sys
 import fcntl
 import glob
 import json
@@ -44,6 +47,11 @@ LINKS = {'repo': 'https://github.com/nixfred/trackpad.pulse',
          'upstream': 'https://github.com/davefano/omarchy-trackpad-plus',
          'origin': 'https://github.com/awkent01/omarchy-touchpad-widget'}
 UNIT_NAME = 'trackpad-pulse.service'
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+GESTURES_LUA = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'omarchy/toggles/hypr/zz-trackpad-pulse-gestures.lua'
+HINT_INTERVAL = 600
+# Where the fingers land, as a coarse grid over the pad, kept per day.
+HEAT_W, HEAT_H = 32, 20
 
 # Omarchy removes users from the `input` group on purpose (migration
 # 1787865477: membership lets any process keylog). This rule grants the
@@ -231,6 +239,8 @@ class Pad:
         self.session = None
         self.sessions = []
         self.prev = None
+        self.heat = [0] * (HEAT_W * HEAT_H)
+        self.hours = [0] * 24
         self.counts = zero_counters()
         self.hist = [0.0] * (BINS + 1)
         self.peak = 0.0
@@ -329,8 +339,13 @@ class Pad:
                                 'peak': 0.0, 'lead': next((k for k, s in self.slots.items() if s is lead), None),
                                 'x0': lead['x'] / self.res_x, 'y0': lead['y'] / self.res_y, 'x1': lead['x'] / self.res_x, 'y1': lead['y'] / self.res_y}
                 self.counts['touches'] += 1
+                self.hours[time.localtime().tm_hour] += 1
             ses = self.session
             ses['max'] = max(ses['max'], fingers)
+            for s in active:
+                hx = min(HEAT_W - 1, max(0, int((s['x'] - self.range_x[0]) / (self.range_x[1] - self.range_x[0]) * HEAT_W)))
+                hy = min(HEAT_H - 1, max(0, int((s['y'] - self.range_y[0]) / (self.range_y[1] - self.range_y[0]) * HEAT_H)))
+                self.heat[hy * HEAT_W + hx] += 1
             ses['dist'] += dist
             ses['peak'] = max(ses['peak'], speed)
             leader = self.slots.get(ses['lead'])
@@ -411,6 +426,11 @@ class Pad:
         counts, self.counts = self.counts, zero_counters()
         hist, self.hist = self.hist, [0.0] * (BINS + 1)
         return counts, hist
+
+    def take_maps(self):
+        heat, self.heat = self.heat, [0] * (HEAT_W * HEAT_H)
+        hours, self.hours = self.hours, [0] * 24
+        return heat, hours
 
     def facts(self):
         f = dict(self.info)
@@ -592,7 +612,55 @@ def db_open():
     db.execute('CREATE TABLE IF NOT EXISTS sessions (ts REAL, kind TEXT, fingers INTEGER, duration REAL, dist REAL, '
                'peak REAL, mean REAL, dx REAL, dy REAL, flag TEXT, ref REAL)')
     db.execute('CREATE INDEX IF NOT EXISTS sessions_ts ON sessions (ts)')
+    # One row per calendar day, kept forever: a year is 365 short rows.
+    db.execute('CREATE TABLE IF NOT EXISTS days (day TEXT PRIMARY KEY, touches INTEGER, taps INTEGER, clicks INTEGER, moves INTEGER, '
+               'scrolls INTEGER, gestures INTEGER, palms INTEGER, distance REAL, scroll REAL, active REAL, moving REAL, peak REAL)')
     return db
+
+
+def record_day(db, today):
+    c = today['counts']
+    db.execute('INSERT OR REPLACE INTO days VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+               (today['day'], c['touches'], c['taps'] + c['taps2'] + c['taps3'], c['clicks'] + c['rightClicks'], c['moves'], c['scrolls'],
+                c['pinches'] + c['swipes3'] + c['swipes4'], c['palms'], round(c['distance'], 1), round(c['scroll'], 1),
+                round(c['active'], 1), round(c['moving'], 1), round(today.get('peak', 0.0), 1)))
+    db.commit()
+
+
+WINDOW_KEYS = ('distance', 'touches', 'taps', 'clicks', 'active')
+
+
+def counts_window(c):
+    """The five numbers every window carries, from a counters dict."""
+    return {'distance': c.get('distance', 0.0), 'touches': c.get('touches', 0),
+            'taps': c.get('taps', 0) + c.get('taps2', 0) + c.get('taps3', 0),
+            'clicks': c.get('clicks', 0) + c.get('rightClicks', 0), 'active': c.get('active', 0.0)}
+
+
+def windows(db, today, now, recent=None):
+    """Distance, touches, taps, clicks and active time over the last minute, hour, today, week, month, year and all time.
+
+    `recent` is the recorder's rolling list of (bucketStart, counts) ten-second
+    buckets, so the minute is a true trailing 60 s rather than the calendar
+    minute in progress.
+    """
+    live = counts_window(today['counts'])
+    minute = {k: 0 for k in WINDOW_KEYS}
+    for start, counts in (recent or []):
+        if start >= now - 60:
+            for k, val in counts_window(counts).items():
+                minute[k] += val
+    hour = db.execute('SELECT SUM(distance), SUM(touches), SUM(taps), SUM(clicks), SUM(active) FROM minutes WHERE ts >= ?', (now - 3600,)).fetchone()
+
+    def span(since_day):
+        row = db.execute('SELECT SUM(distance), SUM(touches), SUM(taps), SUM(clicks), SUM(active), COUNT(*) FROM days WHERE day >= ? AND day < ?', (since_day, today['day'])).fetchone()
+        return {'distance': (row[0] or 0) + live['distance'], 'touches': (row[1] or 0) + live['touches'], 'taps': (row[2] or 0) + live['taps'],
+                'clicks': (row[3] or 0) + live['clicks'], 'active': (row[4] or 0) + live['active'], 'days': (row[5] or 0) + 1}
+    first = db.execute('SELECT MIN(day) FROM days').fetchone()[0] or today['day']
+    return {'minute': minute,
+            'hour': {'distance': hour[0] or 0, 'touches': hour[1] or 0, 'taps': hour[2] or 0, 'clicks': hour[3] or 0, 'active': hour[4] or 0},
+            'today': live, 'week': span(day_key(now - 6 * 86400)), 'month': span(day_key(now - 29 * 86400)),
+            'year': span(day_key(now - 364 * 86400)), 'all': span('0000-00-00'), 'firstDay': min(first, today['day'])}
 
 
 def record_sessions(db, recs):
@@ -676,18 +744,35 @@ class Recorder:
         self.last_history = 0.0
         self.live_clear_pending = False
         self.pending_sessions = []
+        self.last_hint = time.time() - HINT_INTERVAL + 60
+        self.recent = deque()   # (bucketStart, counts) ten-second buckets for the trailing minute
 
     def _load_today(self):
+        fresh = self._fresh_today(time.time())
         try:
             saved = json.loads((STATE / 'today.json').read_text())
-            if saved.get('day') == day_key(time.time()):
-                return saved
-        except (OSError, ValueError):
+            if saved.get('day') == fresh['day'] and isinstance(saved.get('counts'), dict):
+                # Merge over a fresh record: a release that adds a counter must
+                # not choke on the file the previous release wrote.
+                fresh['counts'].update({k: saved['counts'].get(k, 0) for k in COUNTERS})
+                for key in ('hist', 'peak', 'peakAt', 'lastTouch', 'heat', 'hours'):
+                    if key in saved:
+                        fresh[key] = saved[key]
+                if len(fresh.get('heat') or []) != HEAT_W * HEAT_H:
+                    fresh['heat'] = [0] * (HEAT_W * HEAT_H)
+                if len(fresh.get('hours') or []) != 24:
+                    fresh['hours'] = [0] * 24
+                if isinstance(saved.get('cursor'), dict):
+                    fresh['cursor'].update(saved['cursor'])
+                if len(fresh['hist']) != BINS + 1:
+                    fresh['hist'] = [0.0] * (BINS + 1)
+        except (OSError, ValueError, TypeError):
             pass
-        return self._fresh_today(time.time())
+        return fresh
 
     def _fresh_today(self, ts):
         return {'day': day_key(ts), 'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'peakAt': 0.0, 'lastTouch': 0.0,
+                'heat': [0] * (HEAT_W * HEAT_H), 'hours': [0] * 24,
                 'cursor': {'distance': 0.0, 'active': 0.0, 'moving': 0.0, 'peak': 0.0, 'peakAt': 0.0, 'hist': [0.0] * (BINS + 1)}}
 
     @property
@@ -756,10 +841,23 @@ class Recorder:
             if pad.sessions:
                 self.pending_sessions.extend(pad.sessions)
                 pad.sessions = []
+            heat, hours = pad.take_maps()
+            for i, n in enumerate(heat):
+                if n:
+                    self.today['heat'][i] += n
+            for i, n in enumerate(hours):
+                if n:
+                    self.today['hours'][i] += n
             counts, hist = pad.take()
+            bucket = int(now // 10) * 10
+            if not self.recent or self.recent[-1][0] != bucket:
+                self.recent.append((bucket, zero_counters()))
+                while self.recent and self.recent[0][0] < now - 70:
+                    self.recent.popleft()
             for k, v in counts.items():
                 self.minute['counts'][k] += v
                 self.today['counts'][k] += v
+                self.recent[-1][1][k] += v
             for i, v in enumerate(hist):
                 self.minute['hist'][i] += v
                 self.today['hist'][i] += v
@@ -793,8 +891,15 @@ class Recorder:
             if counts['frames'] or counts['distance'] > 0 or counts['touches']:
                 record(self.db, self.minute['start'], counts, self.minute['hist'], self.access)
             self.minute = {'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'start': now}
+            record_day(self.db, self.today)
             atomic(STATE, 'history.json', {str(s): history(self.db, s, now) for s in (3600, 86400, 604800)})
             self.last_history = now
+        if now - self.last_hint >= HINT_INTERVAL:
+            self.last_hint = now
+            try:
+                write_hint(self.db, now)
+            except Exception as e:  # noqa: BLE001 - a hint is advice, never a reason to stop recording
+                print('Trackpad Pulse: hint: ' + str(e), flush=True)
 
     def touching(self):
         return any(pad.fingers for _, pad in self.pads.values())
@@ -816,7 +921,12 @@ class Recorder:
                 pads.append(dict(info, readable=False, error=self.denied.get(node, '')))
         pads.sort(key=lambda p: p['node'])
         week = week_summary(self.db, now)
-        return {'ts': now, 'warm': True, 'access': self.access, 'inputGroup': in_input_group(), 'udevRule': udev_rule_present(),
+        try:
+            spans = windows(self.db, self.today, now, self.recent)
+        except sqlite3.Error:
+            spans = {}
+        return {'ts': now, 'warm': True, 'access': self.access, 'inputGroup': in_input_group(), 'udevRule': udev_rule_present(), 'windows': spans,
+                'heatW': HEAT_W, 'heatH': HEAT_H,
                 'udevRulePath': str(UDEV_RULE_PATH), 'pads': pads, 'today': self.today, 'week': week,
                 'binMmS': BIN_MM_S, 'bins': BINS, 'mmPerUnitMs': MM_PER_UNIT_MS, 'pid': os.getpid(),
                 'cursorSocket': bool(self.cursor.path), 'lastTouch': max([pad.last_touch for _, pad in self.pads.values()] + [self.today.get('lastTouch', 0.0)])}
@@ -829,6 +939,13 @@ class Recorder:
                 return
             atomic(STATE, 'history.json', {str(s): history(self.db, s) for s in (3600, 86400, 604800)})
             while True:
+                try:
+                    self.tick()
+                except Exception as e:  # noqa: BLE001 - one bad tick must not stop the recording
+                    print('Trackpad Pulse: %s: %s' % (type(e).__name__, e), flush=True)
+                    time.sleep(1)
+
+    def tick(self):
                 now = time.time()
                 if now - self.last_scan >= 10:
                     self.scan(now)
@@ -1029,6 +1146,263 @@ def optimize_applied(entry):
     return {'message': 'Applied and logged. The next Optimize reports whether this one helped.'}
 
 
+# ---- the standing check: does the best curve differ from the one in use? ------
+def current_settings():
+    """The selected pad's live settings, through Trackpad Plus's own backend."""
+    result = subprocess.run([sys.executable, str(PLUGIN_ROOT / 'trackpads.py'), 'state'], capture_output=True, text=True, timeout=20, check=False)
+    data = json.loads(result.stdout or '{}')
+    devices = [d for d in data.get('devices', []) if isinstance(d, dict)]
+    if not devices:
+        raise RuntimeError('no trackpad in Trackpad Plus state')
+    dev = next((d for d in devices if d.get('connected')), devices[0])
+    s = dev['settings']
+    profile = (s.get('curve_preset') or 'custom') if s.get('accel_profile') == 'custom' else s.get('accel_profile', 'adaptive')
+    scale = s.get('scroll_scale') or max(1, s.get('scroll_factor', 0.4))
+    return {'device': dev.get('id'), 'profile': profile, 'curve': s.get('curve'), 'scrollFactor': s.get('scroll_factor', 0.4) / scale,
+            'scrollScale': scale, 'gainMaximum': scale}
+
+
+def hint_signature(changes):
+    return hashlib.sha1(json.dumps(sorted([str(c['key']), str(c['to'])] for c in changes)).encode()).hexdigest()[:12]
+
+
+def write_hint(db, now):
+    """Re-run the optimizer against the settings in use and leave the verdict for the panel to light up."""
+    current = current_settings()
+    log = load_log()
+    applied = [e for e in log if e.get('applied')]
+    since = max(now - RETENTION, applied[-1]['ts'] if applied else 0)
+    p = propose(current, load_sessions(db, since), load_hist(db, since), log, now)
+    summary = ' · '.join('%s %s → %s' % (c['label'], '—' if c['from'] is None else c['from'], c['to']) for c in p['changes'])
+    atomic(STATE, 'hint.json', {'ts': now, 'device': current.get('device'), 'verdict': p['verdict'], 'confidence': p['confidence'],
+                                'changes': p['changes'], 'signature': hint_signature(p['changes']), 'summary': summary,
+                                'movingSeconds': p['evidence'].get('movingSeconds', 0)})
+
+
+# ---- themes ------------------------------------------------------------------
+def theme_names():
+    out = subprocess.run(['omarchy-theme-list'], capture_output=True, text=True, timeout=10, check=False).stdout
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def theme_current():
+    return subprocess.run(['omarchy-theme-current'], capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+
+
+def pick_theme(names, current, step):
+    """The next, previous or a random other theme. Pure."""
+    if not names:
+        raise RuntimeError('No themes installed.')
+    if step == 'random':
+        others = [n for n in names if n != current] or names
+        return random.choice(others)
+    index = names.index(current) if current in names else -1
+    return names[(index + (1 if step == 'next' else -1)) % len(names)]
+
+
+def theme_step(step):
+    names = theme_names()
+    target = pick_theme(names, theme_current(), step)
+    result = subprocess.run(['omarchy-theme-set', target], capture_output=True, text=True, timeout=60, check=False)
+    if result.returncode:
+        raise RuntimeError('omarchy-theme-set failed: ' + (result.stderr.strip() or 'no reason given')[:160])
+    return {'message': 'Theme: ' + target}
+
+
+# ---- gestures ----------------------------------------------------------------
+# Every slot Hyprland offers for three and four fingers, and every action the
+# catalogue knows. The panel only ever sends ids; the Lua below is built from
+# these constants and nothing else reaches Hyprland's config.
+FINGERS = (3, 4)
+DIRECTIONS = ('left', 'right', 'up', 'down', 'pinchin', 'pinchout')
+SLOTS = ['%d-%s' % (f, d) for f in FINGERS for d in DIRECTIONS]
+AXIS = {'left': 'horizontal', 'right': 'horizontal', 'up': 'vertical', 'down': 'vertical'}
+PARTNER = {'left': 'right', 'right': 'left', 'up': 'down', 'down': 'up'}
+COLLECTOR = str(Path(__file__).resolve())
+
+
+def _exec(cmd):
+    return {'kind': 'exec', 'cmd': cmd}
+
+
+def _dispatch(lua):
+    return {'kind': 'dispatch', 'lua': lua}
+
+
+def _native(action, **extra):
+    return dict({'kind': 'native', 'action': action}, **extra)
+
+
+CATALOGUE = [
+    {'id': 'none', 'group': 'Nothing', 'label': 'Nothing', 'hint': 'Leave this gesture unassigned.', 'spec': {'kind': 'none'}},
+    # Workspaces
+    {'id': 'ws-slide', 'group': 'Workspaces', 'label': 'Slide between workspaces', 'hint': 'Follows your fingers, animated, like macOS. Takes both directions of the axis.', 'pair': True, 'spec': _native('workspace')},
+    {'id': 'ws-next', 'group': 'Workspaces', 'label': 'Next workspace', 'hint': 'Jump one workspace to the right.', 'spec': _dispatch('hl.dsp.focus({ workspace = "e+1" })')},
+    {'id': 'ws-prev', 'group': 'Workspaces', 'label': 'Previous workspace', 'hint': 'Jump one workspace to the left.', 'spec': _dispatch('hl.dsp.focus({ workspace = "e-1" })')},
+    {'id': 'ws-last', 'group': 'Workspaces', 'label': 'Last used workspace', 'hint': 'Back to where you just were.', 'spec': _dispatch('hl.dsp.focus({ workspace = "previous" })')},
+    {'id': 'ws-scratch', 'group': 'Workspaces', 'label': 'Toggle the scratchpad', 'hint': 'The special workspace, in and out.', 'spec': _native('special', workspace_name='scratchpad')},
+    {'id': 'ws-layout', 'group': 'Workspaces', 'label': 'Toggle workspace layout', 'hint': 'Tiled or scrolling, per workspace.', 'spec': _exec('omarchy-hyprland-workspace-layout-toggle')},
+    {'id': 'scroll-move', 'group': 'Workspaces', 'label': 'Scroll the tape', 'hint': 'Move along the scrolling layout, 1:1. Takes both directions of the axis.', 'pair': True, 'spec': _native('scroll_move')},
+    # Windows
+    {'id': 'win-fullscreen', 'group': 'Windows', 'label': 'Fullscreen window', 'hint': 'Toggle the active window fullscreen.', 'spec': _native('fullscreen')},
+    {'id': 'win-maximize', 'group': 'Windows', 'label': 'Maximize window', 'hint': 'Fill the screen but keep the bar.', 'spec': _native('fullscreen', mode='maximize')},
+    {'id': 'win-close', 'group': 'Windows', 'label': 'Close window', 'hint': 'Close the active window.', 'spec': _native('close')},
+    {'id': 'win-float', 'group': 'Windows', 'label': 'Float or tile window', 'hint': 'Pop the window out of the tiling, or back in.', 'spec': _native('float')},
+    {'id': 'win-move', 'group': 'Windows', 'label': 'Move window', 'hint': 'Drag the active window with the gesture. Takes both directions of the axis.', 'pair': True, 'spec': _native('move')},
+    {'id': 'win-resize', 'group': 'Windows', 'label': 'Resize window', 'hint': 'Resize the active window with the gesture. Takes both directions of the axis.', 'pair': True, 'spec': _native('resize')},
+    {'id': 'focus-left', 'group': 'Windows', 'label': 'Focus window to the left', 'hint': 'Move focus one window left.', 'spec': _dispatch('hl.dsp.focus({ direction = "l" })')},
+    {'id': 'focus-right', 'group': 'Windows', 'label': 'Focus window to the right', 'hint': 'Move focus one window right.', 'spec': _dispatch('hl.dsp.focus({ direction = "r" })')},
+    {'id': 'focus-up', 'group': 'Windows', 'label': 'Focus window above', 'hint': 'Move focus one window up.', 'spec': _dispatch('hl.dsp.focus({ direction = "u" })')},
+    {'id': 'focus-down', 'group': 'Windows', 'label': 'Focus window below', 'hint': 'Move focus one window down.', 'spec': _dispatch('hl.dsp.focus({ direction = "d" })')},
+    {'id': 'win-gaps', 'group': 'Windows', 'label': 'Toggle window gaps', 'hint': 'Gaps on or off, everywhere.', 'spec': _exec('omarchy-hyprland-window-gaps-toggle')},
+    {'id': 'win-transparency', 'group': 'Windows', 'label': 'Toggle window transparency', 'hint': 'See through the active window, or not.', 'spec': _exec('omarchy-hyprland-window-transparency-toggle')},
+    # Themes & backgrounds
+    {'id': 'theme-next', 'group': 'Themes & backgrounds', 'label': 'Next theme', 'hint': 'Step through your installed themes.', 'spec': _exec(shlex.join([sys.executable, COLLECTOR, 'theme-next']))},
+    {'id': 'theme-prev', 'group': 'Themes & backgrounds', 'label': 'Previous theme', 'hint': 'Step back through your themes.', 'spec': _exec(shlex.join([sys.executable, COLLECTOR, 'theme-prev']))},
+    {'id': 'theme-random', 'group': 'Themes & backgrounds', 'label': 'Random theme', 'hint': 'Surprise me.', 'spec': _exec(shlex.join([sys.executable, COLLECTOR, 'theme-random']))},
+    {'id': 'theme-pick', 'group': 'Themes & backgrounds', 'label': 'Theme picker', 'hint': "Open Omarchy's theme switcher.", 'spec': _exec('omarchy-theme-switcher')},
+    {'id': 'bg-next', 'group': 'Themes & backgrounds', 'label': 'Next background', 'hint': "The current theme's next background.", 'spec': _exec('omarchy-theme-bg-next')},
+    {'id': 'bg-pick', 'group': 'Themes & backgrounds', 'label': 'Background picker', 'hint': "Open Omarchy's background switcher.", 'spec': _exec('omarchy-theme-bg-switcher')},
+    {'id': 'nightlight', 'group': 'Themes & backgrounds', 'label': 'Toggle night light', 'hint': 'Warm the screen, or cool it.', 'spec': _exec('omarchy-toggle-nightlight')},
+    # Omarchy
+    {'id': 'menu', 'group': 'Omarchy', 'label': 'Omarchy menu', 'hint': 'The main menu.', 'spec': _exec('omarchy-menu toggle')},
+    {'id': 'emoji', 'group': 'Omarchy', 'label': 'Emoji picker', 'hint': 'Search and insert an emoji.', 'spec': _exec('omarchy-menu-emoji')},
+    {'id': 'clipboard', 'group': 'Omarchy', 'label': 'Clipboard history', 'hint': 'Pick something you copied earlier.', 'spec': _exec('omarchy-menu-clipboard')},
+    {'id': 'keybindings', 'group': 'Omarchy', 'label': 'Keybindings', 'hint': 'Search every shortcut.', 'spec': _exec('omarchy-menu-keybindings')},
+    {'id': 'shot-region', 'group': 'Omarchy', 'label': 'Screenshot a region', 'hint': 'Select an area and capture it.', 'spec': _exec('omarchy-capture-screenshot region')},
+    {'id': 'shot-full', 'group': 'Omarchy', 'label': 'Screenshot the screen', 'hint': 'Capture everything.', 'spec': _exec('omarchy-capture-screenshot fullscreen')},
+    {'id': 'record', 'group': 'Omarchy', 'label': 'Screen recording', 'hint': 'Start or stop recording.', 'spec': _exec('omarchy-capture-screenrecording')},
+    {'id': 'lock', 'group': 'Omarchy', 'label': 'Lock the screen', 'hint': 'Lock now.', 'spec': _exec('omarchy-system-lock')},
+    {'id': 'screensaver', 'group': 'Omarchy', 'label': 'Screensaver', 'hint': 'Start the Omarchy screensaver.', 'spec': _exec('omarchy-launch-screensaver')},
+    {'id': 'bar', 'group': 'Omarchy', 'label': 'Toggle the bar', 'hint': 'Hide or show the top bar.', 'spec': _exec('omarchy-toggle-bar toggle')},
+    {'id': 'dnd', 'group': 'Omarchy', 'label': 'Do not disturb', 'hint': 'Silence notifications, or let them back.', 'spec': _exec('omarchy-toggle-notification-silencing')},
+    {'id': 'terminal', 'group': 'Omarchy', 'label': 'New terminal', 'hint': 'Open a terminal.', 'spec': _exec('omarchy-launch-terminal')},
+    {'id': 'browser', 'group': 'Omarchy', 'label': 'Browser', 'hint': 'Open or focus the browser.', 'spec': _exec('omarchy-launch-browser')},
+    {'id': 'files', 'group': 'Omarchy', 'label': 'Files', 'hint': 'Open the file manager.', 'spec': _exec('omarchy-launch-nautilus')},
+    # Media & audio
+    {'id': 'vol-up', 'group': 'Media & audio', 'label': 'Volume up', 'hint': 'Raise the volume with the OSD.', 'spec': _exec('omarchy-audio-output-volume raise')},
+    {'id': 'vol-down', 'group': 'Media & audio', 'label': 'Volume down', 'hint': 'Lower the volume with the OSD.', 'spec': _exec('omarchy-audio-output-volume lower')},
+    {'id': 'mute', 'group': 'Media & audio', 'label': 'Mute', 'hint': 'Toggle mute.', 'spec': _exec('omarchy-audio-output-volume mute-toggle')},
+    {'id': 'mic-mute', 'group': 'Media & audio', 'label': 'Mute microphone', 'hint': 'Toggle the mic.', 'spec': _exec('omarchy-audio-input-mute')},
+    {'id': 'audio-switch', 'group': 'Media & audio', 'label': 'Switch audio output', 'hint': 'Next speaker or headset.', 'spec': _exec('omarchy-audio-output-switch')},
+    {'id': 'bright-up', 'group': 'Media & audio', 'label': 'Brightness up', 'hint': 'Screen brighter by 5%.', 'requires': 'omarchy-brightness-display', 'spec': _exec('omarchy-brightness-display +5%')},
+    {'id': 'bright-down', 'group': 'Media & audio', 'label': 'Brightness down', 'hint': 'Screen dimmer by 5%.', 'requires': 'omarchy-brightness-display', 'spec': _exec('omarchy-brightness-display 5%-')},
+    {'id': 'play-pause', 'group': 'Media & audio', 'label': 'Play / pause', 'hint': 'Needs playerctl.', 'requires': 'playerctl', 'spec': _exec('playerctl play-pause')},
+    {'id': 'track-next', 'group': 'Media & audio', 'label': 'Next track', 'hint': 'Needs playerctl.', 'requires': 'playerctl', 'spec': _exec('playerctl next')},
+    {'id': 'track-prev', 'group': 'Media & audio', 'label': 'Previous track', 'hint': 'Needs playerctl.', 'requires': 'playerctl', 'spec': _exec('playerctl previous')},
+    # Zoom
+    {'id': 'zoom', 'group': 'Zoom', 'label': 'Zoom the screen ×2', 'hint': 'Toggle a 2× zoom at the cursor. Made for pinches.', 'spec': _native('cursor_zoom', zoom_level=2)},
+    {'id': 'zoom-live', 'group': 'Zoom', 'label': 'Zoom with the pinch', 'hint': 'Zoom follows the pinch live. Made for pinches.', 'spec': _native('cursor_zoom', zoom_level=1, mode='live')},
+    # Trackpad Pulse
+    {'id': 'pulse-open', 'group': 'Trackpad Pulse', 'label': 'Open Trackpad Pulse', 'hint': 'The dashboard.', 'spec': _exec('omarchy-shell nixfred.trackpad-pulse toggle')},
+    {'id': 'pulse-optimize', 'group': 'Trackpad Pulse', 'label': 'Optimize for my hand', 'hint': 'A fresh proposal on Pointer feel.', 'spec': _exec('omarchy-shell nixfred.trackpad-pulse optimize')},
+    {'id': 'pad-off', 'group': 'Trackpad Pulse', 'label': 'Trackpad off', 'hint': 'Switch the pad off; turn it back on from the bar icon.', 'spec': _exec('omarchy-shell nixfred.trackpad-pulse enable false')},
+]
+CATALOGUE_BY_ID = {a['id']: a for a in CATALOGUE}
+DEFAULT_GESTURES = {'3-left': 'ws-slide', '3-right': 'ws-slide', '3-up': 'win-fullscreen', '3-down': 'ws-scratch',
+                    '3-pinchin': 'none', '3-pinchout': 'none',
+                    '4-left': 'theme-prev', '4-right': 'theme-next', '4-up': 'bg-next', '4-down': 'menu',
+                    '4-pinchin': 'none', '4-pinchout': 'zoom'}
+
+
+def gesture_catalogue():
+    """The catalogue, minus actions whose command is not installed here."""
+    out = []
+    for a in CATALOGUE:
+        entry = {k: a[k] for k in ('id', 'group', 'label', 'hint')}
+        entry['pair'] = bool(a.get('pair'))
+        entry['available'] = not a.get('requires') or bool(shutil.which(a['requires']))
+        out.append(entry)
+    current = None
+    try:
+        current = normalize_gestures(json.loads((STATE / 'gestures.json').read_text()))
+    except (OSError, ValueError, RuntimeError):
+        current = None
+    return {'actions': out, 'slots': SLOTS, 'defaults': DEFAULT_GESTURES, 'file': str(GESTURES_LUA),
+            'applied': GESTURES_LUA.exists(), 'current': current if GESTURES_LUA.exists() else None}
+
+
+def lua_quote(value):
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
+
+
+def normalize_gestures(assignments):
+    """Validate a slot→action map from the panel. Unknown slots or actions are refused, not guessed."""
+    if not isinstance(assignments, dict):
+        raise RuntimeError('Gestures must be an object of slot → action.')
+    out = {slot: 'none' for slot in SLOTS}
+    for slot, action in assignments.items():
+        if slot not in out:
+            raise RuntimeError('Unknown gesture slot: ' + str(slot)[:40])
+        if action not in CATALOGUE_BY_ID:
+            raise RuntimeError('Unknown action: ' + str(action)[:40])
+        out[slot] = action
+    # A pair action owns its whole axis: both directions say the same thing.
+    for slot, action in list(out.items()):
+        fingers, direction = slot.split('-')
+        if direction in PARTNER and CATALOGUE_BY_ID[action].get('pair'):
+            out['%s-%s' % (fingers, PARTNER[direction])] = action
+    return out
+
+
+def gestures_lua(assignments):
+    """The Hyprland Lua for a validated map. Pair actions are emitted once per axis."""
+    lines = ['do -- Managed by nixfred.trackpad-pulse. Change gestures in Trackpad Pulse.']
+    emitted = set()
+    for slot in SLOTS:
+        action = CATALOGUE_BY_ID[assignments.get(slot, 'none')]
+        spec = action['spec']
+        if spec['kind'] == 'none':
+            continue
+        fingers, direction = slot.split('-')
+        if action.get('pair'):
+            direction = AXIS.get(direction, direction)
+            if (fingers, direction) in emitted:
+                continue
+            emitted.add((fingers, direction))
+        fields = ['fingers = %s' % fingers, 'direction = %s' % lua_quote(direction)]
+        if spec['kind'] == 'native':
+            fields.append('action = %s' % lua_quote(spec['action']))
+            for key in ('workspace_name', 'mode'):
+                if key in spec:
+                    fields.append('%s = %s' % (key, lua_quote(spec[key])))
+            if 'zoom_level' in spec:
+                fields.append('zoom_level = %s' % spec['zoom_level'])
+        elif spec['kind'] == 'exec':
+            fields.append('action = function() hl.exec_cmd(%s) end' % lua_quote(spec['cmd']))
+        else:
+            fields.append('action = function() hl.dispatch(%s) end' % spec['lua'])
+        lines.append('hl.gesture({ ' + ', '.join(fields) + ' })')
+    return '\n'.join(lines + ['end']) + '\n'
+
+
+def _reload_hyprland():
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import trackpads  # noqa: E402 - Trackpad Plus's bounded hyprctl and hardened writer
+    trackpads.hypr('reload', 'config-only')
+
+
+def gestures_apply(assignments):
+    clean = normalize_gestures(assignments)
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import trackpads  # noqa: E402
+    trackpads.atomic_write(GESTURES_LUA, gestures_lua(clean))
+    _reload_hyprland()
+    atomic(STATE, 'gestures.json', clean)
+    live = sum(1 for a in clean.values() if a != 'none')
+    return {'message': '%d gesture%s live in Hyprland.' % (live, '' if live == 1 else 's'), 'gestures': clean}
+
+
+def gestures_remove():
+    for path in (GESTURES_LUA, STATE / 'gestures.json'):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    _reload_hyprland()
+    return {'message': 'Gesture file removed; Hyprland reloaded. Your own input.lua gestures, if any, are all that is left.'}
+
+
 # ---- actions --------------------------------------------------------------
 def unit_text(script):
     return ('[Unit]\nDescription=Trackpad Pulse: touch telemetry and seven days of history\n'
@@ -1122,7 +1496,9 @@ def one_shot():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule', 'optimize', 'optimize-applied'])
+    parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
+                                           'optimize', 'optimize-applied', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
+                                           'theme-next', 'theme-prev', 'theme-random'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
     args = parser.parse_args()
@@ -1135,14 +1511,23 @@ def main():
         if args.action == 'udev-rule':
             print(UDEV_RULE, end='')
             return
-        if args.action in ('optimize', 'optimize-applied'):
+        if args.action in ('optimize', 'optimize-applied', 'gestures-apply'):
             try:
                 payload = json.loads(args.payload or '{}')
             except ValueError:
-                raise RuntimeError('The optimizer needs a JSON payload.')
+                raise RuntimeError('This action needs a JSON payload.')
             if not isinstance(payload, dict):
-                raise RuntimeError('The optimizer payload must be an object.')
-            value = optimize(payload) if args.action == 'optimize' else optimize_applied(payload)
+                raise RuntimeError('The payload must be an object.')
+            value = {'optimize': optimize, 'optimize-applied': optimize_applied, 'gestures-apply': gestures_apply}[args.action](payload)
+        elif args.action == 'hint':
+            write_hint(db_open(), time.time())
+            value = json.loads((STATE / 'hint.json').read_text())
+        elif args.action == 'gestures-catalogue':
+            value = gesture_catalogue()
+        elif args.action == 'gestures-remove':
+            value = gestures_remove()
+        elif args.action.startswith('theme-'):
+            value = theme_step(args.action[6:])
         else:
             value = {'snapshot': one_shot, 'install-service': install_service, 'uninstall-service': uninstall_service,
                      'grant-access': grant_access, 'revoke-access': revoke_access}.get(args.action, lambda: visit(args.link))()

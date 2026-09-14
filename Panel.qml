@@ -398,6 +398,7 @@ Panel {
     { key: "overview", label: "Overview" },
     { key: "controls", label: "Controls" },
     { key: "feel", label: "Pointer feel" },
+    { key: "gestures", label: "Gestures" },
     { key: "lab", label: "Touch lab" },
     { key: "about", label: "About" }
   ]
@@ -418,6 +419,7 @@ Panel {
   // borrows the week until it has half a minute of movement of its own.
   readonly property var feelHist: Pulse.total(todayHist) >= 30 || !week.hist ? todayHist : week.hist
   readonly property var chart: histories[String(range)] || ({ points: [], seconds: range, now: now, bucket: 60, count: 0, peak: 0, busiest: 0, touches: 0, distance: 0 })
+  readonly property var spans: snap.windows || ({})
   readonly property var pads: snap.pads || []
   readonly property var readablePads: pads.filter(function(p) { return p.readable })
   readonly property var livePads: live.pads || []
@@ -480,20 +482,91 @@ Panel {
       access: root.snap.access || "offline", stale: root.stale, verdict: root.verdict, animated: root.animated,
       fingers: root.fingersNow, speed: root.speedNow, hz: root.hzNow, today: root.todayCounts, peak: root.today.peak || 0,
       samples: root.chart.count || 0, pads: root.pads.length, panelWidth: panel.contentWidth, panelHeight: panel.contentHeight,
+      travel: root.spans, gestures: root.gestures, hint: root.hintActive ? root.hint.summary : "", catalogue: root.catalogue.length,
       contentNeeded: shell.implicitHeight, availableHeight: panel.availableCardHeight, availableWidth: panel.availableCardWidth,
       action: root.actionStatus, error: root.settingsError })
   }
   // The recorder's actions return one JSON line each. Links never go through
   // here: they are constants handed to xdg-open detached, after the panel
   // closes, the way the other Pulse plugins learned to do it.
-  function runPulse(action) {
+  function runPulse(action, extra, mode) {
     if (pulseProc.running) return
-    root.actionStatus = action === "grant-access" ? "Asking polkit for permission to install the udev rule…"
+    pulseProc.mode = mode || "status"
+    if (!mode) root.actionStatus = action === "grant-access" ? "Asking polkit for permission to install the udev rule…"
       : action === "revoke-access" ? "Asking polkit to remove the udev rule…"
       : action === "install-service" ? "Starting the recorder…" : "Working…"
-    pulseProc.command = root.bounded(130, ["python3", root.collector, action])
+    pulseProc.command = root.bounded(130, ["python3", root.collector, action].concat(extra || []))
     pulseProc.running = true
   }
+  // ---- the standing check ------------------------------------------------
+  // The recorder re-runs the optimizer every ten minutes against the settings
+  // in use and leaves hint.json. A hint with changes and some confidence that
+  // you have not seen yet lights the Optimize button and the Pointer feel tab.
+  property var hint: ({})
+  readonly property bool hintActive: !!(root.hint && root.hint.changes && root.hint.changes.length > 0 && root.hint.confidence !== "low"
+    && String(root.setting("hintSeen", "")) !== String(root.hint.signature) && !root.stale && !root.noAccess)
+  function hintSeen() { root.setSetting("hintSeen", root.hint && root.hint.signature ? String(root.hint.signature) : "") }
+  property real pulseOpacity: 1
+  SequentialAnimation on pulseOpacity {
+    running: root.hintActive && root.opened
+    loops: Animation.Infinite
+    NumberAnimation { to: 0.35; duration: 650 }
+    NumberAnimation { to: 1; duration: 650 }
+    onRunningChanged: if (!running) root.pulseOpacity = 1
+  }
+  FileView {
+    id: hintFile; path: root.stateDir + "/hint.json"; watchChanges: true; printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { root.hint = JSON.parse(text()) } catch (e) {} }
+  }
+
+  // ---- gestures ----------------------------------------------------------
+  // The catalogue comes from the recorder, so the panel never holds a command
+  // line; it sends slot and action ids and the recorder writes the Lua.
+  property var catalogue: []
+  property var catalogueMeta: ({})
+  readonly property var gestureDefaults: root.catalogueMeta.defaults || ({})
+  // The recorder keeps the applied map beside the Lua it wrote, so the page
+  // knows what is live even when the widget entry could not save it.
+  readonly property var gestures: root.setting("gestures", null) || root.catalogueMeta.current || null
+  readonly property bool gesturesApplied: !!root.gestures
+  readonly property var gestureOptions: {
+    var out = []
+    for (var i = 0; i < root.catalogue.length; i++) {
+      var a = root.catalogue[i]
+      if (!a.available) continue
+      out.push({ value: a.id, label: a.group === "Nothing" ? "Nothing" : a.group + "  ·  " + a.label, description: a.hint })
+    }
+    return out
+  }
+  function gestureValue(slot) {
+    var g = root.gestures || root.gestureDefaults
+    return g && g[slot] ? String(g[slot]) : "none"
+  }
+  function actionById(id) {
+    for (var i = 0; i < root.catalogue.length; i++) if (root.catalogue[i].id === id) return root.catalogue[i]
+    return null
+  }
+  function loadCatalogue() {
+    if (root.catalogue.length || pulseProc.running) return
+    root.runPulse("gestures-catalogue", [], "catalogue")
+  }
+  function setGesture(slot, id) {
+    var base = root.gestures || root.gestureDefaults, next = {}
+    for (var k in base) next[k] = base[k]
+    next[slot] = id
+    var parts = slot.split("-"), partners = { left: "right", right: "left", up: "down", down: "up" }
+    var partner = partners[parts[1]] ? parts[0] + "-" + partners[parts[1]] : null
+    var spec = root.actionById(id), was = partner ? root.actionById(next[partner]) : null
+    if (partner && spec && spec.pair) next[partner] = id
+    else if (partner && was && was.pair && !(spec && spec.pair)) next[partner] = "none"
+    root.applyGestures(next)
+  }
+  function applyGestures(map) {
+    root.actionStatus = "Writing the gesture file and reloading Hyprland…"
+    root.runPulse("gestures-apply", [JSON.stringify(map)], "gestures")
+  }
+
   // ---- the optimizer ----------------------------------------------------
   // A proposal from the recorder: what to change and why, from the shape of
   // the finger-speed distribution and the overshoot / re-stroke rates since
@@ -529,6 +602,7 @@ Panel {
     }
     var entry = { changes: p.changes, evidence: p.evidence, verdict: p.verdict, practiceMedianMs: curveEditor.practiceMedianMs }
     root.proposal = null
+    root.hintSeen()
     if (pulseProc.running) { root.actionStatus = "Applied; the log entry will be written on the next pass."; return }
     pulseProc.mode = "applied"
     pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-applied", JSON.stringify(entry)])
@@ -577,6 +651,8 @@ Panel {
         try {
           var r = JSON.parse(String(text))
           if (pulseProc.mode === "optimize" && !r.error) { root.proposal = r; root.actionStatus = "" }
+          else if (pulseProc.mode === "catalogue" && !r.error) { root.catalogue = r.actions || []; root.catalogueMeta = r; root.actionStatus = "" }
+          else if (pulseProc.mode === "gestures" && !r.error) { if (r.gestures) root.setSetting("gestures", r.gestures); root.actionStatus = r.message || "Gestures applied." }
           else root.actionStatus = r.error || r.message || "Done"
         } catch (e) { root.actionStatus = "The recorder helper did not answer." }
         pulseProc.mode = "status"
@@ -598,6 +674,7 @@ Panel {
     function chooser(): void { root.chooseMode = true; root.open() }
     function enable(on: bool): void { root.setTouchpadEnabled(on) }
     function optimize(): void { root.requestOptimize(); root.open() }
+    function gestures(): void { root.showPage("gestures"); root.open() }
   }
 
   // ---- Lifecycle ----
@@ -621,6 +698,7 @@ Panel {
   onActiveChanged: {
     if (active === "feel" && opened) { editingCurve = true; curveEditor.begin() }
     else editingCurve = false
+    if (active === "gestures") root.loadCatalogue()
   }
 
   // Poll while open so external changes are reflected.
@@ -690,7 +768,9 @@ Panel {
       if (!root.stale) {
         lines.push("Today: " + Pulse.readout(root.snap, root.live, 0) + " touches · " + Pulse.readout(root.snap, root.live, 2) + " taps · " + Pulse.int(root.todayCounts.clicks) + " clicks · " + Pulse.readout(root.snap, root.live, 1))
         lines.push("Peak " + Pulse.readout(root.snap, root.live, 3) + " · active " + Pulse.readout(root.snap, root.live, 6) + " · " + Pulse.readout(root.snap, root.live, 7) + " palms rejected")
+        if (root.spans.all) lines.push("Travelled " + Pulse.distance((root.spans.week || {}).distance) + " this week · " + Pulse.distance(root.spans.all.distance) + " all time")
       }
+      if (root.hintActive) lines.push("Optimize has a new proposal: " + root.hint.summary)
       lines.push("Left-click: dashboard · Right-click: on/off")
       return lines.join("\n")
     }
@@ -998,9 +1078,10 @@ Panel {
             Action {
               required property int index
               required property var modelData
-              text: modelData.label
+              text: modelData.label + (modelData.key === "feel" && root.hintActive ? "  •" : "")
               selected: root.active === modelData.key
               accent: root.tint
+              opacity: modelData.key === "feel" && root.hintActive && root.active !== "feel" ? root.pulseOpacity : 1
               onClicked: root.active = modelData.key
             }
           }
@@ -1049,6 +1130,26 @@ Panel {
                 enabled: !pulseProc.running
                 onClicked: root.runPulse(root.stale ? "install-service" : "grant-access")
               }
+            }
+          }
+
+          // The standing check found a better curve than the one in use.
+          Rectangle {
+            width: parent.width
+            visible: root.hintActive
+            height: visible ? 64 : 0
+            radius: 12
+            color: Util.alpha(root.tint, 0.10)
+            border.color: Qt.alpha(root.tint, 0.4 + 0.5 * root.pulseOpacity)
+            Row {
+              anchors.fill: parent; anchors.margins: 12; spacing: 14
+              Column {
+                width: parent.width - 230; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                Heading { font.pixelSize: 12; text: "OPTIMIZE HAS A NEW PROPOSAL  ·  " + String(root.hint.confidence || "").toUpperCase() + " CONFIDENCE" }
+                Label { width: parent.width; elide: Text.ElideRight; font.pixelSize: 10; text: String(root.hint.summary || "") + "  ·  checked " + Pulse.ago(root.hint.ts, root.now) }
+              }
+              Action { anchors.verticalCenter: parent.verticalCenter; text: "Review"; accent: root.tint; selected: true; onClicked: root.requestOptimize() }
+              Action { anchors.verticalCenter: parent.verticalCenter; text: "Later"; onClicked: root.hintSeen() }
             }
           }
 
@@ -1157,6 +1258,33 @@ Panel {
                     : "Median " + (root.cursorOnly ? Pulse.pxSpeed(Pulse.percentile(root.todayHist, root.binWidth * 10, 0.5)) : Pulse.speed(Pulse.percentile(root.todayHist, root.binWidth, 0.5)))
                       + "  ·  90% under " + (root.cursorOnly ? Pulse.pxSpeed(Pulse.percentile(root.todayHist, root.binWidth * 10, 0.9)) : Pulse.speed(Pulse.percentile(root.todayHist, root.binWidth, 0.9)))
                       + (root.pointerFeel.profile === "custom" || root.pointerFeel.profile === "mac" ? "  ·  shaded: where your curve accelerates" : "")
+                }
+              }
+            }
+          }
+
+          // Distance, touches and clicks on every clock that matters.
+          Row {
+            width: parent.width; spacing: 8
+            Repeater {
+              model: [
+                { l: "LAST MINUTE", k: "minute" }, { l: "LAST HOUR", k: "hour" }, { l: "TODAY", k: "today" }, { l: "THIS WEEK", k: "week" },
+                { l: "THIS MONTH", k: "month" }, { l: "THIS YEAR", k: "year" }, { l: "ALL TIME", k: "all" }
+              ]
+              Rectangle {
+                id: travelCard
+                required property var modelData
+                readonly property var span: root.spans[travelCard.modelData.k] || ({})
+                width: (shell.width - 48) / 7; height: 70; radius: 12; color: root.card; border.color: root.cardEdge
+                Column {
+                  anchors.fill: parent; anchors.margins: 10; spacing: 2
+                  Label { text: travelCard.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }
+                  Heading { text: root.stale || root.cursorOnly ? "—" : Pulse.distance(travelCard.span.distance); font.pixelSize: 17; width: parent.width; elide: Text.ElideRight }
+                  Label {
+                    font.pixelSize: 9; width: parent.width; elide: Text.ElideRight
+                    text: root.stale || root.cursorOnly ? "" : Pulse.int(travelCard.span.touches) + " touches · " + Pulse.int(travelCard.span.clicks) + " clicks"
+                      + (travelCard.modelData.k === "all" && root.spans.firstDay ? " · " + (travelCard.span.days || 0) + " d" : "")
+                  }
                 }
               }
             }
@@ -1524,9 +1652,9 @@ Panel {
                 }
                 Row {
                   spacing: 8
-                  Action { visible: !root.proposal; text: pulseProc.running && pulseProc.mode === "optimize" ? "Reading…" : "Optimize for my hand"; accent: root.tint; selected: true; enabled: !pulseProc.running && !root.cursorOnly && !root.stale; onClicked: root.requestOptimize() }
+                  Action { visible: !root.proposal; text: pulseProc.running && pulseProc.mode === "optimize" ? "Reading…" : root.hintActive ? "Optimize for my hand  ·  new proposal" : "Optimize for my hand"; accent: root.tint; selected: true; opacity: root.hintActive ? root.pulseOpacity : 1; enabled: !pulseProc.running && !root.cursorOnly && !root.stale; onClicked: root.requestOptimize() }
                   Action { visible: !!root.proposal && root.proposal.changes.length > 0; text: "Apply this"; accent: root.tint; selected: true; enabled: !(actionProc.running || root.pendingActions.length > 0); onClicked: root.applyProposal() }
-                  Action { visible: !!root.proposal; text: root.proposal && root.proposal.changes.length > 0 ? "Dismiss" : "Close"; onClicked: root.proposal = null }
+                  Action { visible: !!root.proposal; text: root.proposal && root.proposal.changes.length > 0 ? "Dismiss" : "Close"; onClicked: { root.proposal = null; root.hintSeen() } }
                   Label { visible: root.cursorOnly || root.stale; anchors.verticalCenter: parent.verticalCenter; font.pixelSize: 10; text: root.stale ? "needs the recorder" : "needs pad access, not cursor-only" }
                 }
               }
@@ -1562,6 +1690,82 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        // ================= GESTURES =================
+        Column {
+          width: parent.width
+          spacing: 12
+          visible: !root.chooseMode && root.active === "gestures"
+          height: visible ? implicitHeight : 0
+          Rectangle {
+            width: parent.width; height: 58; radius: 12
+            color: Util.alpha(root.gesturesApplied ? root.tint : Color.accent, 0.09)
+            border.color: Util.alpha(root.gesturesApplied ? root.tint : Color.accent, 0.38)
+            Row {
+              anchors.fill: parent; anchors.margins: 12; spacing: 14
+              Column {
+                width: parent.width - 330; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                Heading { font.pixelSize: 12; text: root.gesturesApplied ? "LIVE IN HYPRLAND" : "SUGGESTED, NOT APPLIED YET" }
+                Label { width: parent.width; elide: Text.ElideRight; font.pixelSize: 10
+                  text: root.gesturesApplied ? "Pick an action for any gesture; it applies at once. The file is " + (root.catalogueMeta.file || "") + "."
+                    : "These are suggestions. Press Apply suggested to switch them on, or change any of them first." }
+              }
+              Action { anchors.verticalCenter: parent.verticalCenter; text: root.gesturesApplied ? "Reset to suggested" : "Apply suggested"; accent: root.tint; selected: !root.gesturesApplied; enabled: !pulseProc.running && root.catalogue.length > 0; onClicked: root.applyGestures(root.gestureDefaults) }
+              Action { anchors.verticalCenter: parent.verticalCenter; text: "Clear all"; enabled: !pulseProc.running && root.catalogue.length > 0; onClicked: { var none = {}; for (var k in root.gestureDefaults) none[k] = "none"; root.applyGestures(none) } }
+            }
+          }
+          Row {
+            width: parent.width; spacing: 10
+            Repeater {
+              model: [3, 4]
+              Card {
+                id: fingerCard
+                required property int modelData
+                width: (shell.width - 10) / 2; height: gestureColumn.implicitHeight + 28
+                Column {
+                  id: gestureColumn
+                  anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
+                  spacing: 8
+                  Row {
+                    width: parent.width
+                    Heading { text: fingerCard.modelData + " FINGERS"; font.pixelSize: 12; width: parent.width / 2 }
+                    Label { text: "swipe and pinch"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                  }
+                  Repeater {
+                    model: [
+                      { d: "left", l: "←  Swipe left" }, { d: "right", l: "→  Swipe right" }, { d: "up", l: "↑  Swipe up" }, { d: "down", l: "↓  Swipe down" },
+                      { d: "pinchin", l: "⤡  Pinch in" }, { d: "pinchout", l: "⤢  Pinch out" }
+                    ]
+                    Row {
+                      id: gestureRow
+                      required property var modelData
+                      readonly property string slot: fingerCard.modelData + "-" + modelData.d
+                      readonly property var current: root.actionById(root.gestureValue(slot))
+                      width: gestureColumn.width; spacing: 10
+                      Label { text: gestureRow.modelData.l; width: 128; color: root.ink; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
+                      SearchableDropdown {
+                        width: gestureColumn.width - 138
+                        showLabel: false
+                        options: root.gestureOptions
+                        value: root.gestureValue(gestureRow.slot)
+                        placeholderText: "Search actions…"
+                        emptyText: "No action matches"
+                        onChanged: function(v) { if (v !== root.gestureValue(gestureRow.slot)) root.setGesture(gestureRow.slot, v) }
+                      }
+                    }
+                  }
+                  Label { width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+                    text: fingerCard.modelData === 3 ? "Slide, move, resize and scroll-the-tape follow your fingers and take both directions of their axis." : "Themes and backgrounds live here by default: left and right step through themes, up changes the background." }
+                }
+              }
+            }
+          }
+          Label { visible: root.catalogue.length === 0; text: pulseProc.running ? "Loading the action catalogue…" : "The action catalogue did not load. " + root.actionStatus; font.pixelSize: 11; color: root.ink }
+          Label {
+            width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+            text: "Gestures are Hyprland's own: the panel writes one Lua file of hl.gesture lines into Omarchy's toggles and asks Hyprland to reload, nothing runs in the background. Native actions (slide, fullscreen, close, float, scratchpad, zoom) animate 1:1; the rest run an Omarchy command. If you also define gestures in input.lua they add up, so keep one place in charge."
           }
         }
 
@@ -1652,7 +1856,7 @@ Panel {
           Row {
             width: parent.width; spacing: 10
             Rectangle {
-              width: parent.width * 0.5 - 5; height: 150; radius: 12
+              width: parent.width * 0.5 - 5; height: 196; radius: 12
               color: Util.alpha(Color.accent, 0.09); border.color: Util.alpha(Color.accent, 0.38)
               Column {
                 anchors.fill: parent; anchors.margins: 14; spacing: 8
@@ -1678,28 +1882,95 @@ Panel {
               }
             }
             Card {
-              width: parent.width * 0.5 - 5; height: 150
+              width: parent.width * 0.5 - 5; height: 196
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 3
+                Row {
+                  width: parent.width
+                  Heading { text: "EVERY CLOCK"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: root.spans.firstDay ? "recording since " + root.spans.firstDay : ""; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                }
+                Row {
+                  width: parent.width
+                  Label { text: ""; width: parent.width * 0.16; font.pixelSize: 9 }
+                  Repeater {
+                    model: ["DISTANCE", "TOUCHES", "TAPS", "CLICKS", "ACTIVE", "PER HOUR"]
+                    Label { required property string modelData; text: modelData; font.pixelSize: 9; font.letterSpacing: 1; width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight }
+                  }
+                }
+                Repeater {
+                  model: [
+                    { l: "Last minute", k: "minute", s: 60 }, { l: "Last hour", k: "hour", s: 3600 }, { l: "Today", k: "today", s: 0 }, { l: "Week", k: "week", s: 0 },
+                    { l: "Month", k: "month", s: 0 }, { l: "Year", k: "year", s: 0 }, { l: "All time", k: "all", s: 0 }
+                  ]
+                  Row {
+                    id: clockRow
+                    required property var modelData
+                    readonly property var span: root.spans[clockRow.modelData.k] || ({})
+                    // Touches per hour of active use, so a day of typing does not dilute it.
+                    readonly property real perHour: Pulse.num(clockRow.span.active) > 30 ? Pulse.num(clockRow.span.touches) / (Pulse.num(clockRow.span.active) / 3600) : 0
+                    width: parent.width
+                    Label { text: clockRow.modelData.l; width: parent.width * 0.16; font.pixelSize: 10; color: root.ink }
+                    Label { text: root.stale ? "—" : Pulse.distance(clockRow.span.distance); width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight; font.pixelSize: 10; color: root.ink }
+                    Label { text: root.stale ? "—" : Pulse.int(clockRow.span.touches); width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight; font.pixelSize: 10 }
+                    Label { text: root.stale ? "—" : Pulse.int(clockRow.span.taps); width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight; font.pixelSize: 10 }
+                    Label { text: root.stale ? "—" : Pulse.int(clockRow.span.clicks); width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight; font.pixelSize: 10 }
+                    Label { text: root.stale ? "—" : Pulse.duration(clockRow.span.active); width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight; font.pixelSize: 10 }
+                    Label { text: root.stale || clockRow.perHour <= 0 ? "—" : Pulse.int(clockRow.perHour) + " touches"; width: (parent.width * 0.84) / 6; horizontalAlignment: Text.AlignRight; font.pixelSize: 10 }
+                  }
+                }
+              }
+            }
+          }
+          Row {
+            width: parent.width; spacing: 10
+            Card {
+              width: parent.width * 0.5 - 5; height: 206
               Column {
                 anchors.fill: parent; anchors.margins: 14; spacing: 6
-                Heading { text: "THIS WEEK"; font.pixelSize: 12 }
-                Grid {
-                  width: parent.width; columns: 4; columnSpacing: 10; rowSpacing: 6
-                  Repeater {
-                    model: [
-                      { l: "TOUCHES", v: Pulse.int(root.week.touches) }, { l: "TAPS", v: Pulse.int(root.week.taps) }, { l: "CLICKS", v: Pulse.int(root.week.clicks) }, { l: "GESTURES", v: Pulse.int(root.week.swipes) },
-                      { l: "DISTANCE", v: Pulse.distance(root.week.distance) }, { l: "SCROLLED", v: Pulse.distance(root.week.scroll) }, { l: "ACTIVE", v: Pulse.duration(root.week.active) }, { l: "PALMS", v: Pulse.int(root.week.palms) }
-                    ]
-                    Column {
-                      id: weekFact
-                      required property var modelData
-                      width: (shell.width * 0.5 - 5 - 28 - 30) / 4
-                      spacing: 1
-                      Label { text: weekFact.modelData.l; font.pixelSize: 9; font.letterSpacing: 1 }
-                      Heading { text: root.stale ? "—" : weekFact.modelData.v; font.pixelSize: 14; width: parent.width; elide: Text.ElideRight }
+                Row {
+                  width: parent.width
+                  Heading { text: "WHERE YOU TOUCH"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: "today · brighter = more frames"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                }
+                HeatMap { width: parent.width; height: 150; heat: root.today.heat || []; cols: Pulse.num(root.snap.heatW) || 32; rows: Pulse.num(root.snap.heatH) || 20; aspect: root.padAspect; tint: root.tint; hot: root.heat; ink: root.ink; surface: Color.background }
+              }
+            }
+            Card {
+              width: parent.width * 0.5 - 5; height: 206
+              Column {
+                anchors.fill: parent; anchors.margins: 14; spacing: 6
+                Row {
+                  width: parent.width
+                  Heading { text: "YOUR DAY"; font.pixelSize: 12; width: parent.width / 2 }
+                  Label { text: "touches per hour of the day"; font.pixelSize: 10; width: parent.width / 2; horizontalAlignment: Text.AlignRight }
+                }
+                Item {
+                  id: rhythm
+                  width: parent.width; height: 130
+                  readonly property var hours: root.today.hours || []
+                  readonly property real peak: { var m = 1; for (var i = 0; i < rhythm.hours.length; i++) m = Math.max(m, Pulse.num(rhythm.hours[i])); return m }
+                  Row {
+                    anchors.fill: parent; spacing: 3
+                    Repeater {
+                      model: 24
+                      Item {
+                        id: hourBar
+                        required property int index
+                        width: (rhythm.width - 3 * 23) / 24; height: rhythm.height
+                        Rectangle {
+                          anchors.bottom: parent.bottom; anchors.bottomMargin: 14; width: parent.width; radius: 2
+                          height: Math.max(2, (rhythm.height - 16) * Pulse.num(rhythm.hours[hourBar.index]) / rhythm.peak)
+                          color: hourBar.index === new Date(root.now * 1000).getHours() ? root.tint : Util.alpha(root.tint, 0.45)
+                        }
+                        Label { anchors.bottom: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; font.pixelSize: 8; text: hourBar.index % 3 === 0 ? String(hourBar.index) : "" }
+                      }
                     }
                   }
                 }
-                Label { width: parent.width; font.pixelSize: 10; elide: Text.ElideRight; text: (root.week.minutes || 0) + " minutes recorded  ·  peak " + Pulse.speed(root.week.peak) + "  ·  " + root.stateDir }
+                Label { width: parent.width; font.pixelSize: 10; elide: Text.ElideRight
+                  text: { var h = rhythm.hours, best = 0; for (var i = 0; i < h.length; i++) if (Pulse.num(h[i]) > Pulse.num(h[best])) best = i
+                    return Pulse.num(h[best]) > 0 ? "Busiest hour so far: " + best + ":00 with " + Pulse.int(h[best]) + " touches" : "No touches recorded today yet" } }
               }
             }
           }
@@ -1799,6 +2070,7 @@ Panel {
             Action { text: "Open the dashboard →"; accent: root.tint; selected: true; onClicked: { root.chooseMode = false; root.active = "overview" } }
             Action { text: "Controls"; onClicked: { root.chooseMode = false; root.active = "controls" } }
             Action { text: "Pointer feel"; onClicked: { root.chooseMode = false; root.active = "feel" } }
+            Action { text: "Gestures"; onClicked: { root.chooseMode = false; root.active = "gestures" } }
             Action { text: root.animated ? "Icon animation: on" : "Icon animation: off"; selected: root.animated; accent: root.tint; onClicked: root.setSetting("animated", !root.animated) }
           }
           Label { text: "The icon is the pad itself: it lights where your fingers are and dims when the pad is off.  ·  Esc closes"; font.pixelSize: 10; width: parent.width; wrapMode: Text.WordWrap }

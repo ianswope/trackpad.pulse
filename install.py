@@ -26,7 +26,7 @@ import time
 PLUGIN_ID = 'nixfred.trackpad-pulse'
 UNITS = ('trackpad-pulse.service',)
 PAYLOAD = ('manifest.json', 'Panel.qml', 'CurveEditor.qml', 'Curve.js', 'Model.js', 'Pulse.js', 'TrackpadChip.qml',
-           'TouchHistoryGraph.qml', 'SpeedHistogram.qml', 'trackpads.py', 'touchpad-state', 'touchpad-sensitivity',
+           'TouchHistoryGraph.qml', 'SpeedHistogram.qml', 'HeatMap.qml', 'trackpads.py', 'touchpad-state', 'touchpad-sensitivity',
            'README.md', 'LICENSE', 'collectors')
 PLACEMENT_TRIES = 6
 # The widgets this one replaces. They all write the same settings files, so
