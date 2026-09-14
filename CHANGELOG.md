@@ -2,6 +2,10 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.4.1 — 2026-09-14
+
+- Overview: the touch heatmap now sits in the hero card beside the touch count, in the span left of the live speed readout.
+
 ## 1.4.0 — 2026-09-14
 
 - **Fullscreen apps as gestures.** A new catalogue group with the default terminal and every launchable desktop entry on the machine, each opened as a fullscreen window. Omarchy's launchers detach through `setsid` and `uwsm-app`, so Hyprland's exec-rule prefix cannot follow them; the recorder launches, watches the client list for the window that appears, focuses it by address and fullscreens it. Searchable in every gesture dropdown.

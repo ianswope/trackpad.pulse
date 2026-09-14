@@ -1217,6 +1217,14 @@ Panel {
                   : root.pads.length ? root.pads[0].name + "  ·  not readable" : root.deviceName
               }
             }
+            // Where you touch, today, in the span between the count and the speed.
+            HeatMap {
+              x: 852; y: 10; width: 178; height: 138
+              visible: !root.cursorOnly
+              heat: root.today.heat || []; cols: Pulse.num(root.snap.heatW) || 32; rows: Pulse.num(root.snap.heatH) || 20
+              aspect: root.padAspect; tint: root.tint; hot: root.heat; ink: root.ink; surface: Color.background
+            }
+            Label { x: 852; y: 150; width: 178; horizontalAlignment: Text.AlignHCenter; visible: !root.cursorOnly; font.pixelSize: 9; font.letterSpacing: 1; text: "WHERE YOU TOUCH · TODAY" }
             Column {
               anchors.right: parent.right; anchors.rightMargin: 20; anchors.top: parent.top; anchors.topMargin: 20
               spacing: 2
