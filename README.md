@@ -61,7 +61,9 @@ libinput's custom acceleration profile takes device speed in units per milliseco
 
 So the editor draws the recorded distribution as bars under the curve, and the panel says what it means in words: *half of your movement is slower than 15 mm/s; this draft holds precision gain up to 33 mm/s and reaches full gain at 66 mm/s; 72% of your movement stays in the precision zone, 14% rides the transition, 15% is already at full gain.* Drag a handle and the sentence updates. Apply when the shape matches your hand.
 
-Everything else on this page is David Fano's editor exactly as he built it: System, Mac-inspired, Flat and Custom profiles, four draggable handles with spinners, keyboard steps, target practice, Apply & try, and Restore previous.
+One default does not fit every pad, so **Mac-inspired** is sized per pad: its gains scale with how many screen pixels one millimetre of that pad has to cover, measured by the recorder from the pad's own resolution and the widest monitor. The shipped gains are the anchor at a 124 mm pad on a 1920-pixel screen; a big Magic Trackpad starts gentler, a small pad driving a wide desktop starts quicker, within 0.5–2×. Optimize then fits each pad to its own week of movement, never an average of two.
+
+Everything else on this page is David Fano's editor as he built it: System, Mac-inspired, Flat and Custom profiles, four draggable handles with spinners, keyboard steps, target practice, Apply & try, and Restore previous.
 
 ### Optimize for my hand
 
@@ -141,7 +143,7 @@ The Touch lab draws a heatmap of where your fingers land on the pad, per day, at
 <img src="assets/screenshots/controls.png" width="900" alt="Controls: device selector, the pad's on/off switch, scroll speed, device scale, pointer feel, natural scrolling, tap to click, disable while typing and two-finger right click, all on one screen">
 </div>
 
-Trackpad Plus's per-device controls, laid out in two columns so nothing scrolls: enable or disable the selected pad, scroll speed (0.01–1.00) with a per-device scale, pointer speed for the System and Flat profiles, and the natural scrolling, tap to click, disable-while-typing and two-finger right-click switches. Every change is scoped to one device, debounced, journalled, and rolled back if the compositor refuses it. See [Trackpad Plus](https://github.com/davefano/omarchy-trackpad-plus) for the full account of device scale, Apple and Dell groups, and migration from the original widget.
+Trackpad Plus's per-device controls, laid out in two columns so nothing scrolls: enable or disable the selected pad, scroll speed (0.01–1.00) with a per-device scale, pointer speed for the System and Flat profiles, and the natural scrolling, tap to click, disable-while-typing and two-finger right-click switches. Every change is scoped to one device, debounced, journalled, and rolled back if the compositor refuses it. See [Trackpad Plus](https://github.com/davefano/omarchy-trackpad-plus) for the full account of device scale, Apple and Dell groups, and migration from the original widget. Here the Apple group covers every MacBook's own pad (Apple silicon under Asahi, Intel `bcm5974`, T2), and a Magic Trackpad gets a group of its own.
 
 ---
 

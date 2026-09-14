@@ -163,7 +163,27 @@ function accessLabel(snap) {
     }
 }
 
+// ---- per pad ---------------------------------------------------------------
+// The selected pad's preset scale (its size against the screen), 1 when the
+// recorder has not measured it.
+function presetScale(snap, device) {
+    var pads = (snap && snap.pads) || []
+    for (var i = 0; i < pads.length; i++)
+        if (pads[i].device === device && num(pads[i].presetScale) > 0) return num(pads[i].presetScale)
+    return 1
+}
+
+// The selected pad's week of finger speeds when more than one pad is known
+// and it has history of its own; otherwise the fallback, unchanged.
+function padHist(snap, device, fallback) {
+    var pads = (snap && snap.pads) || [], seen = {}, count = 0
+    for (var i = 0; i < pads.length; i++) if (pads[i].device && !seen[pads[i].device]) { seen[pads[i].device] = true; count++ }
+    var own = ((snap && snap.weekByDevice) || {})[device]
+    return count > 1 && total(own) > 0 ? own : fallback
+}
+
 if (typeof module !== 'undefined') module.exports = {
+    presetScale: presetScale, padHist: padHist,
     clamp: clamp, num: num, int: int, distance: distance, speed: speed, pxSpeed: pxSpeed, duration: duration, ago: ago, pct: pct, hz: hz,
     total: total, percentile: percentile, shareBelow: shareBelow, curveToMm: curveToMm, mmToCurve: mmToCurve,
     MODES: MODES, modeName: modeName, modeTag: modeTag, readout: readout, verdict: verdict, accessLabel: accessLabel

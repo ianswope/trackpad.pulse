@@ -15,7 +15,9 @@ omarchy-touchpad-widget. Two halves, deliberately separate:
   the action queue / debounce / stale-read logic at the root of `Panel.qml`.
   His tests (`test_trackpads.py`, `test_install.py`, `tst_curve.qml`,
   `test-selection.js`) still pass. Do not "improve" that code; fix it upstream
-  or wrap it.
+  or wrap it. The one deliberate exception (1.7.0, Fred's call, "this is our
+  project"): device detection for every Mac and the Magic Trackpad's own group
+  (`UNNAMED_TOUCHPADS`, `APPLE_BUILTIN`, state version 5), plus `Curve.presetFor`.
 - **Telemetry and everything new** is ours: `collectors/trackpad_pulse.py`
   (the recorder and all its actions), `Pulse.js`, `TrackpadChip.qml`,
   `TouchHistoryGraph.qml`, `SpeedHistogram.qml`, `HeatMap.qml`, `install.py`,
@@ -124,6 +126,20 @@ A recorder release that adds a counter must merge over the previous release's
 that. The daemon's loop survives a bad tick now, but the journal
 (`journalctl --user -u trackpad-pulse.service`) is the first place to look
 when numbers stop moving.
+
+## Per pad: identity, size, preset, history
+
+A pad's `device` is its Trackpad Plus group, got by passing `hypr_name()` (Hyprland's
+deviceNameToInternalString: lowercase, space/newline/comma → `-`, `/` kept)
+through `trackpads.group_devices`, so telemetry and settings name the same pad.
+Size comes from the kernel resolution, else udev's `ID_INPUT_WIDTH_MM`, else
+libinput's hints (Apple USB 104×75, default 69×55); `sizeSource` says which.
+`preset_scale()` is screen px per pad mm over `PRESET_PX_PER_MM` (the 124 mm /
+1920 px anchor, a choice), clamped 0.5–2; `preset_gains()` and `Curve.presetFor`
+must agree (a node cross-check test enforces it). Sessions carry `device`,
+per-pad histograms live in `pad_minutes`, optimize log rows carry `device`, and
+`device_log()` treats rows without one as every pad's. `settle()` always writes
+the full log.
 
 ## Report, hand, mouse, auto-off
 

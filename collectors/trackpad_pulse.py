@@ -8,7 +8,7 @@ speed, and the time-weighted distribution of finger speed that the pointer-
 feel editor draws under its acceleration curve.
 
 Settings never come through here. They are David Fano's trackpads.py, which
-this plugin ships unchanged.
+this plugin ships with its device detection widened to every Mac.
 
 Files
   $XDG_STATE_HOME/trackpad-pulse/snapshot.json   counters, device facts, access
@@ -97,6 +97,7 @@ ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x35, 0x36
 ABS_MT_TOOL_TYPE, ABS_MT_TRACKING_ID, ABS_MT_PRESSURE = 0x37, 0x39, 0x3a
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BTN_TOOL_FINGER, BTN_TOUCH = 0x145, 0x14a
+BTN_TOOL_PEN = 0x140
 BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_QUINTTAP = 0x14d, 0x14e, 0x14f, 0x148
 MT_TOOL_PALM = 2
 INPUT_PROP_POINTER, INPUT_PROP_DIRECT = 0, 1
@@ -218,7 +219,12 @@ def parse_devices(text):
         pointer = bit(fields.get('B:PROP', ''), INPUT_PROP_POINTER)
         direct = bit(fields.get('B:PROP', ''), INPUT_PROP_DIRECT)
         named = re.search(r'touchpad|trackpad', name, re.I) is not None
-        if direct or not (multitouch or single) or not (pointer or named):
+        # udev's own test for a touchpad: a finger tool, no pen, not a screen.
+        # It finds pads that set no pointer property and name no touchpad,
+        # like the Intel MacBook's bcm5974.
+        keys = fields.get('B:KEY', '')
+        finger = bit(keys, BTN_TOOL_FINGER) and not bit(keys, BTN_TOOL_PEN)
+        if direct or not (multitouch or single) or not (pointer or named or finger):
             continue
         pads.append({'node': '/dev/input/' + node, 'name': name[:128], 'phys': fields.get('P:Phys', ''),
                      'sysfs': fields.get('S:Sysfs', ''), 'multitouch': multitouch,
@@ -248,6 +254,96 @@ def identity(fd):
     return {'bus': bus, 'vendor': '%04x' % buf[1], 'product': '%04x' % buf[2], 'version': buf[3]}
 
 
+# ---- hardware: which pad, how big, and how its preset should scale ---------
+UDEV_DATA = Path('/run/udev/data')
+# libinput's own answers for a pad that reports no resolution: the size hint it
+# ships for Apple's USB touchpads (50-system-apple.quirks), else its default.
+APPLE_USB_SIZE_MM = (104.0, 75.0)
+DEFAULT_SIZE_MM = (69.0, 55.0)
+# The Mac-inspired gains as Trackpad Plus ships them are taken as right for a
+# pad 124 mm wide driving a screen 1920 logical pixels across, a common laptop.
+# That is the anchor, not a measurement. Any other pad and screen scale the
+# gains by their own pixels per pad millimetre, so a long swipe carries the
+# cursor the same share of the screen; clamped so a wrong size stays usable.
+PRESET_PX_PER_MM = 1920 / 124.0
+PRESET_SCALE_RANGE = (0.5, 2.0)
+
+
+def hypr_name(kernel_name):
+    """The name Hyprland gives a device: lowercased, with spaces, newlines and
+    commas turned into dashes (deviceNameToInternalString). '/' survives."""
+    return ''.join('-' if ch in ' \n,' else ch.lower() if ch.isascii() else ch for ch in kernel_name)
+
+
+def settings_group(kernel_name):
+    """The Trackpad Plus group a pad's settings live in, so telemetry and settings name the same pad."""
+    name = hypr_name(kernel_name)
+    if str(PLUGIN_ROOT) not in sys.path:
+        sys.path.insert(0, str(PLUGIN_ROOT))
+    try:
+        import trackpads  # noqa: E402 - the one place grouping is decided
+        return next(iter(trackpads.group_devices([{'name': name}])), name)
+    except (ImportError, ValueError):
+        return name
+
+
+def udev_size(node):
+    """A pad's width and height in mm as udev recorded them, or None."""
+    try:
+        rdev = os.stat(node).st_rdev
+    except OSError:
+        return None
+    values = {}
+    for line in read(UDEV_DATA / ('c%d:%d' % (os.major(rdev), os.minor(rdev)))).splitlines():
+        if line.startswith('E:') and '=' in line:
+            key, _, value = line[2:].partition('=')
+            values[key] = value
+    try:
+        size = (float(values['ID_INPUT_WIDTH_MM']), float(values['ID_INPUT_HEIGHT_MM']))
+    except (KeyError, ValueError):
+        return None
+    return size if size[0] > 0 and size[1] > 0 else None
+
+
+def screen_width():
+    """The widest monitor in logical pixels: how far a long swipe has to carry the cursor."""
+    try:
+        out = subprocess.run(['hyprctl', 'monitors', '-j'], capture_output=True, text=True, timeout=3, check=False).stdout
+        monitors = json.loads(out or '[]')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+    widths = []
+    for m in monitors if isinstance(monitors, list) else []:
+        try:
+            side = float(m['height'] if int(m.get('transform') or 0) % 2 else m['width'])
+            widths.append(side / float(m.get('scale') or 1))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass
+    return max(widths, default=0.0)
+
+
+def preset_scale(pad_mm, screen_px):
+    if not pad_mm or not screen_px or pad_mm <= 0 or screen_px <= 0:
+        return 1.0
+    low, high = PRESET_SCALE_RANGE
+    return round(min(high, max(low, screen_px / pad_mm / PRESET_PX_PER_MM)), 3)
+
+
+def preset_gains(gain_max, scale=1.0):
+    """The Mac-inspired precision and fast gains for one pad. Keep in sync with Curve.presetFor.
+
+    Sized to the editor's ceiling first, as Trackpad Plus does, then by the
+    pad's scale; Fast swipes never passes the ceiling (Device scale).
+    """
+    factor = min(1.0, gain_max / 1.6)
+    precision, fast = max(0.01, 0.3 * factor), 1.6 * factor
+    k = min(PRESET_SCALE_RANGE[1], max(PRESET_SCALE_RANGE[0], float(scale or 1.0)))
+    if k != 1.0:
+        precision = max(0.01, precision * k)
+        fast = max(precision, min(max(gain_max, fast), fast * k))
+    return round(precision, 4), round(fast, 4)
+
+
 class Pad:
     """One touchpad's event stream turned into counts. Pure: feed() and tick() only.
 
@@ -260,8 +356,12 @@ class Pad:
         self.info = info
         self.axes = axes
         x, y = axes.get('x') or {'min': 0, 'max': 1, 'res': 0}, axes.get('y') or {'min': 0, 'max': 1, 'res': 0}
-        self.res_x = x['res'] or 30.0
-        self.res_y = y['res'] or 30.0
+        # A pad that reports no resolution is sized the way libinput sizes it
+        # (open_pad finds udev's size or libinput's hint), so millimetres stay
+        # physical on it too; 30 units/mm is the last resort for a bare Pad.
+        size = info.get('sizeMm')
+        self.res_x = x['res'] or (max(1, x['max'] - x['min']) / size[0] if size else 30.0)
+        self.res_y = y['res'] or (max(1, y['max'] - y['min']) / size[1] if size else 30.0)
         self.range_x = (x['min'], max(x['max'], x['min'] + 1))
         self.range_y = (y['min'], max(y['max'], y['min'] + 1))
         self.width_mm = (self.range_x[1] - self.range_x[0]) / self.res_x
@@ -447,7 +547,8 @@ class Pad:
                'mean': round(ses['dist'] / max(0.01, now - ses['start']), 1),
                'dx': round(ses['x1'] - ses['x0'], 2), 'dy': round(ses['y1'] - ses['y0'], 2), 'flag': '', 'ref': 0.0, 'app': ses.get('app', ''),
                'x0': round(ses.get('nx0', 0.5), 3), 'y0': round(ses.get('ny0', 0.5), 3), 'clicked': bool(ses['clicked']),
-               'gap': round(ses['start'] - self.prev['end'], 2) if self.prev else None, 'cursor0': ses.get('cursor0'), 'cursor': 0.0, 'stray': ''}
+               'gap': round(ses['start'] - self.prev['end'], 2) if self.prev else None, 'cursor0': ses.get('cursor0'), 'cursor': 0.0, 'stray': '',
+               'device': self.info.get('device', '')}
         rec['flag'], rec['ref'] = flag_session(rec, self.prev)
         if kind == 'move' and rec['dist'] >= LONG_MOVE_MM:
             self.counts['longMoves'] += 1
@@ -666,6 +767,14 @@ def open_pad(info, now):
         pass
     info.update(identity(fd))
     info['multitouch'] = bool(axes['slot'])
+    if axes['x']['res'] and axes['y']['res']:
+        info['sizeSource'] = 'kernel'
+    else:
+        size, source = udev_size(info['node']), 'udev'
+        if not size:
+            apple_usb = info.get('vendor') == '05ac' and info.get('bus') == 'usb'
+            size, source = (APPLE_USB_SIZE_MM, 'libinput hint') if apple_usb else (DEFAULT_SIZE_MM, 'libinput default')
+        info.update(sizeMm=list(size), sizeSource=source)
     return fd, Pad(info, axes, now)
 
 
@@ -785,6 +894,9 @@ def db_open():
     db.execute('CREATE TABLE IF NOT EXISTS sessions (ts REAL, kind TEXT, fingers INTEGER, duration REAL, dist REAL, '
                'peak REAL, mean REAL, dx REAL, dy REAL, flag TEXT, ref REAL)')
     db.execute('CREATE INDEX IF NOT EXISTS sessions_ts ON sessions (ts)')
+    # The finger-speed histogram per pad per minute, so a laptop pad and a
+    # Magic Trackpad are optimized on their own movement, not an average.
+    db.execute('CREATE TABLE IF NOT EXISTS pad_minutes (ts REAL, device TEXT, hist TEXT, PRIMARY KEY (ts, device))')
     # One row per calendar day, kept forever: a year is 365 short rows.
     db.execute('CREATE TABLE IF NOT EXISTS days (day TEXT PRIMARY KEY, touches INTEGER, taps INTEGER, clicks INTEGER, moves INTEGER, '
                'scrolls INTEGER, gestures INTEGER, palms INTEGER, distance REAL, scroll REAL, active REAL, moving REAL, peak REAL)')
@@ -793,7 +905,7 @@ def db_open():
             db.execute('ALTER TABLE days ADD COLUMN %s %s' % (column, kind))
         except sqlite3.OperationalError:
             pass
-    for column, kind in (('x0', 'REAL'), ('y0', 'REAL'), ('gap', 'REAL'), ('cursor', 'REAL DEFAULT 0'), ('stray', 'TEXT DEFAULT \'\'')):
+    for column, kind in (('x0', 'REAL'), ('y0', 'REAL'), ('gap', 'REAL'), ('cursor', 'REAL DEFAULT 0'), ('stray', 'TEXT DEFAULT \'\''), ('device', 'TEXT DEFAULT \'\'')):
         try:
             db.execute('ALTER TABLE sessions ADD COLUMN %s %s' % (column, kind))
         except sqlite3.OperationalError:
@@ -902,20 +1014,32 @@ def windows(db, today, now, recent=None):
 def record_sessions(db, recs):
     if not recs:
         return
-    db.executemany('INSERT INTO sessions (ts, kind, fingers, duration, dist, peak, mean, dx, dy, flag, ref, x0, y0, gap, cursor, stray) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    db.executemany('INSERT INTO sessions (ts, kind, fingers, duration, dist, peak, mean, dx, dy, flag, ref, x0, y0, gap, cursor, stray, device) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                    [(r['wall'], r['kind'], r['fingers'], r['duration'], r['dist'], r['peak'], r['mean'], r['dx'], r['dy'], r['flag'], r['ref'],
-                     r.get('x0'), r.get('y0'), r.get('gap'), r.get('cursor', 0.0), r.get('stray', '')) for r in recs])
+                     r.get('x0'), r.get('y0'), r.get('gap'), r.get('cursor', 0.0), r.get('stray', ''), r.get('device', '')) for r in recs])
     db.commit()
 
 
-def load_sessions(db, since):
-    keys = ('ts', 'kind', 'fingers', 'duration', 'dist', 'peak', 'mean', 'dx', 'dy', 'flag', 'ref', 'x0', 'y0', 'gap', 'cursor', 'stray')
-    return [dict(zip(keys, row)) for row in db.execute('SELECT ts,kind,fingers,duration,dist,peak,mean,dx,dy,flag,ref,x0,y0,gap,cursor,stray FROM sessions WHERE ts >= ? ORDER BY ts', (since,))]
+def load_sessions(db, since, device=None):
+    """Sessions since a time; for one pad, its own plus those recorded before pads were kept apart."""
+    keys = ('ts', 'kind', 'fingers', 'duration', 'dist', 'peak', 'mean', 'dx', 'dy', 'flag', 'ref', 'x0', 'y0', 'gap', 'cursor', 'stray', 'device')
+    query = 'SELECT ts,kind,fingers,duration,dist,peak,mean,dx,dy,flag,ref,x0,y0,gap,cursor,stray,device FROM sessions WHERE ts >= ?'
+    if device:
+        return [dict(zip(keys, row)) for row in db.execute(query + " AND device IN (?, '') ORDER BY ts", (since, device))]
+    return [dict(zip(keys, row)) for row in db.execute(query + ' ORDER BY ts', (since,))]
 
 
-def load_hist(db, since):
+def load_hist(db, since, device=None):
+    """The finger-speed histogram since a time; for one pad, its own minutes
+    plus the combined ones recorded before pads were kept apart."""
     hist = [0.0] * (BINS + 1)
-    for (raw,) in db.execute('SELECT hist FROM minutes WHERE ts >= ?', (since,)):
+    if device:
+        first = db.execute('SELECT MIN(ts) FROM pad_minutes').fetchone()[0]
+        rows = db.execute('SELECT hist FROM pad_minutes WHERE ts >= ? AND device = ? UNION ALL '
+                          'SELECT hist FROM minutes WHERE ts >= ? AND ts < ?', (since, device, since, first if first is not None else float('inf'))).fetchall()
+    else:
+        rows = db.execute('SELECT hist FROM minutes WHERE ts >= ?', (since,)).fetchall()
+    for (raw,) in rows:
         try:
             for i, v in enumerate(json.loads(raw)[:BINS + 1]):
                 hist[i] += v
@@ -924,14 +1048,17 @@ def load_hist(db, since):
     return hist
 
 
-def record(db, ts, counts, hist, source):
+def record(db, ts, counts, hist, source, pads=None):
     db.execute('INSERT OR REPLACE INTO minutes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                (ts, counts.get('touches', 0), counts.get('taps', 0) + counts.get('taps2', 0) + counts.get('taps3', 0),
                 counts.get('clicks', 0) + counts.get('rightClicks', 0), counts.get('distance', 0.0), counts.get('scroll', 0.0),
                 counts.get('swipes3', 0) + counts.get('swipes4', 0) + counts.get('pinches', 0), counts.get('palms', 0),
                 counts.get('active', 0.0), counts.get('peak', 0.0), json.dumps([round(v, 3) for v in hist]), source,
                 read('/proc/sys/kernel/random/boot_id').strip()))
+    db.executemany('INSERT OR REPLACE INTO pad_minutes VALUES (?,?,?)',
+                   [(ts, device, json.dumps([round(v, 3) for v in h])) for device, h in (pads or {}).items() if device])
     db.execute('DELETE FROM minutes WHERE ts < ?', (ts - RETENTION,))
+    db.execute('DELETE FROM pad_minutes WHERE ts < ?', (ts - RETENTION,))
     db.execute('DELETE FROM sessions WHERE ts < ?', (ts - RETENTION,))
     db.commit()
 
@@ -974,7 +1101,9 @@ class Recorder:
         self.cursor = Cursor()
         self.db = db_open()
         self.today = self._load_today()
-        self.minute = {'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'start': time.time()}
+        self.minute = {'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'start': time.time(), 'pads': {}}
+        self.screen_px = 0.0
+        self.week_by_device = {}
         self.last_scan = 0.0
         self.last_live = 0.0
         self.last_snapshot = 0.0
@@ -1043,6 +1172,10 @@ class Recorder:
     def scan(self, now):
         self.last_scan = now
         found = {p['node']: p for p in parse_devices(read('/proc/bus/input/devices'))}
+        for info in found.values():
+            info['hyprName'] = hypr_name(info['name'])
+            info['device'] = settings_group(info['name'])
+        self.screen_px = screen_width()
         for node in list(self.pads):
             if node not in found:
                 os.close(self.pads[node][0])
@@ -1127,9 +1260,11 @@ class Recorder:
                 self.minute['counts'][k] += v
                 self.today['counts'][k] += v
                 self.recent[-1][1][k] += v
+            mine = self.minute['pads'].setdefault(pad.info.get('device', ''), [0.0] * (BINS + 1))
             for i, v in enumerate(hist):
                 self.minute['hist'][i] += v
                 self.today['hist'][i] += v
+                mine[i] += v
             if pad.peak > self.today['peak']:
                 self.today['peak'], self.today['peakAt'] = pad.peak, pad.peak_at
             self.today['lastTouch'] = max(self.today.get('lastTouch', 0.0), pad.last_touch)
@@ -1158,12 +1293,14 @@ class Recorder:
         if now - self.minute['start'] >= 60:
             counts = dict(self.minute['counts'], peak=self.minute['peak'])
             if counts['frames'] or counts['distance'] > 0 or counts['touches']:
-                record(self.db, self.minute['start'], counts, self.minute['hist'], self.access)
-            self.minute = {'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'start': now}
+                record(self.db, self.minute['start'], counts, self.minute['hist'], self.access, self.minute['pads'])
+            self.minute = {'counts': zero_counters(), 'hist': [0.0] * (BINS + 1), 'peak': 0.0, 'start': now, 'pads': {}}
             taken = self.mouse.take()
             self.today['mouse']['active'] += taken['active']
             self.today['mouse']['distance'] += taken['distance']
             record_day(self.db, self.today)
+            devices = {pad.info.get('device') for _, pad in self.pads.values()} - {None, ''}
+            self.week_by_device = {d: [round(v, 2) for v in load_hist(self.db, now - RETENTION, d)] for d in sorted(devices)}
             atomic(STATE, 'history.json', {str(s): history(self.db, s, now) for s in (3600, 86400, 604800)})
             self.last_history = now
         if now - self.last_hint >= HINT_INTERVAL:
@@ -1326,9 +1463,11 @@ class Recorder:
         pads = []
         for node, info in self.known.items():
             if node in self.pads:
-                pads.append(dict(self.pads[node][1].facts(), readable=True))
+                pad = self.pads[node][1]
+                pads.append(dict(pad.facts(), readable=True, presetScale=preset_scale(pad.width_mm, self.screen_px)))
             else:
-                pads.append(dict(info, readable=False, error=self.denied.get(node, '')))
+                size = udev_size(node)
+                pads.append(dict(info, readable=False, error=self.denied.get(node, ''), presetScale=preset_scale(size[0] if size else 0, self.screen_px)))
         pads.sort(key=lambda p: p['node'])
         week = week_summary(self.db, now)
         try:
@@ -1343,6 +1482,7 @@ class Recorder:
                 'strayGuard': dict(stray_summary(self.db, self.today, now), enabled=self.stray_wanted),
                 'hand': hand_verdict(self.today.get('heat') or [], self.today.get('palmX', 0.0), self.today.get('palmN', 0)),
                 'udevRulePath': str(UDEV_RULE_PATH), 'pads': pads, 'today': self.today, 'week': week,
+                'screenPx': round(self.screen_px), 'weekByDevice': self.week_by_device,
                 'binMmS': BIN_MM_S, 'bins': BINS, 'mmPerUnitMs': MM_PER_UNIT_MS, 'pid': os.getpid(),
                 'cursorSocket': bool(self.cursor.path), 'lastTouch': max([pad.last_touch for _, pad in self.pads.values()] + [self.today.get('lastTouch', 0.0)])}
 
@@ -1562,12 +1702,10 @@ def propose(current, sessions, hist, log=None, now=None):
         new_start = round(min(3.6, max(0.0, p45 / MM_PER_UNIT_MS)), 2)
         new_end = round(min(4.0, max(new_start + 0.2, p90 / MM_PER_UNIT_MS)), 2)
         if not custom:
-            base = {'precision': 0.3, 'start': new_start, 'end': new_end, 'fast': 1.6}
-            factor = min(1.0, gain_max / base['fast'])
-            base['precision'] = max(0.01, round(base['precision'] * factor, 4))
-            base['fast'] = round(base['fast'] * factor, 4)
+            precision, fast = preset_gains(gain_max, current.get('presetScale') or 1.0)
+            base = {'precision': precision, 'start': new_start, 'end': new_end, 'fast': fast}
             first_fit = [{'key': 'profile', 'label': 'Profile', 'from': profile, 'to': 'custom', 'direction': 'shape',
-                          'reason': 'A custom curve is the only place Start and End exist; gains start from the Mac-inspired preset.'},
+                          'reason': 'A custom curve is the only place Start and End exist; gains start from the Mac-inspired preset, sized to this pad and screen.'},
                          {'key': 'start', 'label': 'Start', 'from': None, 'to': new_start, 'direction': 'shape', 'reason': '45%% of your movement is slower than %.0f mm/s; below that the curve stays at precision gain.' % p45},
                          {'key': 'end', 'label': 'End', 'from': None, 'to': new_end, 'direction': 'shape', 'reason': '90%% of your movement is slower than %.0f mm/s; the fastest tenth gets full gain.' % p90}]
             for c in first_fit:
@@ -1678,7 +1816,7 @@ def propose(current, sessions, hist, log=None, now=None):
     return {'verdict': verdict, 'confidence': confidence, 'proposal': proposal, 'changes': changes, 'queued': queued, 'notes': notes, 'message': message.strip(),
             'evidence': dict(r, movingSeconds=round(moving, 1), p45=round(p45, 1), median=round(p50, 1), p90=round(p90, 1),
                              startMm=round(start_mm, 1), endMm=round(end_mm, 1)),
-            'previous': previous, 'now': now}
+            'previous': previous, 'now': now, 'device': current.get('device') or ''}
 
 
 def load_log():
@@ -1689,12 +1827,17 @@ def load_log():
         return []
 
 
+def device_log(log, device):
+    """The optimize log rows for one pad. Rows written before pads were kept apart belong to every pad."""
+    return [e for e in log if not device or e.get('device', device) in (device, '')]
+
+
 def settle(log, p):
     """Write a decided judgement of the last applied pass into the log, once, so it is never re-judged."""
     prev = p.get('previous')
     if not prev or prev['judgement'] == 'watching':
         return
-    applied = [e for e in log if e.get('applied')]
+    applied = [e for e in device_log(log, p.get('device')) if e.get('applied')]
     if not applied or applied[-1].get('judgement'):
         return
     applied[-1].update({'judgement': prev['judgement'], 'judgeReason': prev['reason'], 'judgedTs': p['now'], 'after': prev['after']})
@@ -1706,12 +1849,14 @@ def optimize(current):
     now = time.time()
     log = load_log()
     since = now - RETENTION
-    applied = [e for e in log if e.get('applied')]
+    device = current.get('device') or ''
+    mine = device_log(log, device)
+    applied = [e for e in mine if e.get('applied')]
     # Judge with everything since the last applied pass, so an old habit does
     # not outvote a week of the new curve; the first pass sees the whole week.
     if applied:
         since = max(since, applied[-1]['ts'])
-    p = propose(current, load_sessions(db, since), load_hist(db, since), log, now)
+    p = propose(current, load_sessions(db, since, device), load_hist(db, since, device), mine, now)
     settle(log, p)
     return p
 
@@ -1721,7 +1866,8 @@ def optimize_applied(entry):
     changes = entry.get('changes', [])
     head = changes[0] if changes else {}
     row = {'ts': time.time(), 'applied': True, 'changes': changes, 'evidence': entry.get('evidence', {}),
-           'practiceMedianMs': entry.get('practiceMedianMs'), 'verdict': entry.get('verdict', ''), 'watch': head.get('watch')}
+           'practiceMedianMs': entry.get('practiceMedianMs'), 'verdict': entry.get('verdict', ''), 'watch': head.get('watch'),
+           'device': str(entry.get('device') or '')}
     if head.get('undo'):
         original = next((e for e in log if e.get('applied') and e.get('ts') == head.get('reverts')), None)
         if original:
@@ -1741,7 +1887,7 @@ def optimize_applied(entry):
 def optimize_keep(entry):
     """You disagree with an undo: keep the change and let the optimizer move on."""
     log = load_log()
-    applied = [e for e in log if e.get('applied')]
+    applied = [e for e in device_log(log, entry.get('device')) if e.get('applied')]
     if not applied or applied[-1].get('judgement') != 'undo':
         return {'message': 'Nothing is waiting to be undone.'}
     applied[-1]['judgement'] = 'kept by you'
@@ -1751,19 +1897,33 @@ def optimize_keep(entry):
 
 
 # ---- the standing check: does the best curve differ from the one in use? ------
-def current_settings():
-    """The selected pad's live settings, through Trackpad Plus's own backend."""
+def current_settings(device=None):
+    """One pad's live settings, through Trackpad Plus's own backend.
+
+    The pad asked for, else the connected pad touched last (from the recorder's
+    snapshot), else the first connected one. presetScale is that pad's size
+    against the screen, for the Mac-inspired gains.
+    """
     result = subprocess.run([sys.executable, str(PLUGIN_ROOT / 'trackpads.py'), 'state'], capture_output=True, text=True, timeout=20, check=False)
     data = json.loads(result.stdout or '{}')
     devices = [d for d in data.get('devices', []) if isinstance(d, dict)]
     if not devices:
         raise RuntimeError('no trackpad in Trackpad Plus state')
-    dev = next((d for d in devices if d.get('connected')), devices[0])
+    connected = [d for d in devices if d.get('connected')]
+    try:
+        pads = [p for p in json.loads((STATE / 'snapshot.json').read_text()).get('pads') or [] if isinstance(p, dict)]
+    except (OSError, ValueError, AttributeError):
+        pads = []
+    ids = [d.get('id') for d in connected]
+    touched = sorted((p for p in pads if p.get('device') in ids and p.get('lastTouch')), key=lambda p: -p['lastTouch'])
+    wanted = device or (touched[0]['device'] if touched else None)
+    dev = next((d for d in devices if d.get('id') == wanted), None) or (connected or devices)[0]
     s = dev['settings']
     profile = (s.get('curve_preset') or 'custom') if s.get('accel_profile') == 'custom' else s.get('accel_profile', 'adaptive')
     scale = s.get('scroll_scale') or max(1, s.get('scroll_factor', 0.4))
+    preset = next((p['presetScale'] for p in pads if p.get('device') == dev.get('id') and p.get('presetScale')), 1.0)
     return {'device': dev.get('id'), 'profile': profile, 'curve': s.get('curve'), 'scrollFactor': s.get('scroll_factor', 0.4) / scale,
-            'scrollScale': scale, 'gainMaximum': scale}
+            'scrollScale': scale, 'gainMaximum': scale, 'presetScale': preset}
 
 
 def hint_signature(changes):
@@ -1774,9 +1934,11 @@ def write_hint(db, now):
     """Re-run the optimizer against the settings in use and leave the verdict for the panel to light up."""
     current = current_settings()
     log = load_log()
-    applied = [e for e in log if e.get('applied')]
+    device = current.get('device') or ''
+    mine = device_log(log, device)
+    applied = [e for e in mine if e.get('applied')]
     since = max(now - RETENTION, applied[-1]['ts'] if applied else 0)
-    p = propose(current, load_sessions(db, since), load_hist(db, since), log, now)
+    p = propose(current, load_sessions(db, since, device), load_hist(db, since, device), mine, now)
     settle(log, p)
     summary = ('Undo ' if p['verdict'] == 'undo' else '') + ' · '.join('%s %s → %s' % (c['label'], fmt_value(c['from']), fmt_value(c['to'])) for c in p['changes'])
     atomic(STATE, 'hint.json', {'ts': now, 'device': current.get('device'), 'verdict': p['verdict'], 'confidence': p['confidence'],

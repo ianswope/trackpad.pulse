@@ -241,4 +241,14 @@ console.log('Passed: device selection, fine scroll steps, stale-read rejection, 
   assert.equal(Pulse.verdict({ warm: true, ts: 0, access: 'evdev' }, {}, true, true, 100), 'RECORDER STALE');
   assert.equal(Pulse.verdict(Object.assign({}, snap, { access: 'cursor' }), {}, true, true, 100), 'CURSOR ONLY · NO PAD ACCESS');
   assert.equal(Pulse.readout(Object.assign({}, snap, { access: 'cursor', today: { counts: {}, cursor: { distance: 4321 } } }), {}, 1), '4,321 px');
+  const two = { pads: [{ device: 'apple', presetScale: 0.78 }, { device: 'elan', presetScale: 1.2 }], weekByDevice: { apple: [1, 2], elan: [0, 0] } };
+  assert.equal(Pulse.presetScale(two, 'elan'), 1.2);
+  assert.equal(Pulse.presetScale(two, 'dell'), 1, 'an unmeasured pad keeps the preset as shipped');
+  assert.deepEqual(Pulse.padHist(two, 'apple', [9]), [1, 2]);
+  assert.deepEqual(Pulse.padHist(two, 'elan', [9]), [9], 'no history of its own yet: the combined one');
+  assert.deepEqual(Pulse.padHist({ pads: [{ device: 'apple' }], weekByDevice: { apple: [1] } }, 'apple', [9]), [9], 'one pad: unchanged');
+  const CurveJs = require('./Curve.js');
+  assert.deepEqual(CurveJs.presetFor(1, 1), CurveJs.presetForScale(1));
+  assert.deepEqual(CurveJs.presetFor(1, 0.5), { precision: 0.09375, start: 0.8, end: 2.8, fast: 0.5 });
+  assert.deepEqual(CurveJs.presetFor(1, 1.5), { precision: 0.28125, start: 0.8, end: 2.8, fast: 1 }, 'Fast stops at the ceiling');
 }

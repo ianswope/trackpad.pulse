@@ -9,6 +9,19 @@ function presetForScale(maximum) {
   return curve
 }
 
+// The Mac-inspired preset for one pad: sized to the chart ceiling as above,
+// then by hardwareScale, the pad's pixels per millimetre against the preset's
+// anchor (the recorder measures it). Fast never passes the ceiling. Keep in
+// sync with preset_gains in collectors/trackpad_pulse.py.
+function presetFor(maximum, hardwareScale) {
+  var curve = presetForScale(maximum)
+  var k = Number(hardwareScale) > 0 ? Math.max(0.5, Math.min(2, Number(hardwareScale))) : 1
+  if (k === 1) return curve
+  curve.precision = Math.max(0.01, Number((curve.precision * k).toFixed(6)))
+  curve.fast = Math.max(curve.precision, Number(Math.min(Math.max(maximum, curve.fast), curve.fast * k).toFixed(6)))
+  return curve
+}
+
 function copy(value) { return JSON.parse(JSON.stringify(value)) }
 
 // Preserve the shape of saved three-handle curves when opening the new editor.
@@ -63,4 +76,4 @@ function fromSettings(settings) {
   }
 }
 
-if (typeof module !== "undefined") module.exports = { defaults, presetForScale, copy, normalize, gain, points, sampledGain, adjust, fromSettings }
+if (typeof module !== "undefined") module.exports = { defaults, presetForScale, presetFor, copy, normalize, gain, points, sampledGain, adjust, fromSettings }

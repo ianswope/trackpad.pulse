@@ -125,7 +125,10 @@ def validate_native_curve(curve):
 
 
 def validate_name(name):
-    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.:+-]{1,128}', name):
+    # '/' is real: Hyprland keeps it, and a T2 MacBook's pad is
+    # "apple-inc.-apple-internal-keyboard-/-trackpad". Names reach Lua only
+    # through json.dumps, so it quotes like any other character.
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.:+/-]{1,128}', name):
         raise ValueError('Unsupported trackpad device name')
     return name
 
@@ -151,18 +154,26 @@ def validate_setting(key, value):
     return value
 
 
+# Touchpads whose names say neither touchpad nor trackpad: Apple silicon under
+# Asahi, Intel MacBooks (the kernel's bcm5974 driver), and a Lenovo Synaptics.
+UNNAMED_TOUCHPADS = ('apple-mtp-multi-touch', 'bcm5974', 'synaptics-tm3512-010')
+# A MacBook's own pad, on Asahi, Intel and T2 Macs. A Magic Trackpad is other
+# hardware, a different size, and keeps its own settings.
+APPLE_BUILTIN = ('apple-mtp-multi-touch', 'bcm5974', 'apple-inc.-apple-internal-keyboard-/-trackpad')
+MAGIC_TRACKPAD = 'apple-inc.-magic-trackpad'
+
+
 def group_devices(mice):
     groups = {}
     for mouse in mice:
         name = mouse['name']
-        is_builtin_apple = name == 'apple-mtp-multi-touch'
-        # This Lenovo Synaptics touchpad omits the device type from its name.
-        is_known_touchpad = is_builtin_apple or name == 'synaptics-tm3512-010'
-        if not is_known_touchpad and not re.search('touchpad|trackpad', name, re.I):
+        if name not in UNNAMED_TOUCHPADS and not re.search('touchpad|trackpad', name, re.I):
             continue
         validate_name(name)
-        if is_builtin_apple or name.startswith('apple-inc.-magic-trackpad'):
+        if name.startswith(APPLE_BUILTIN):
             key, label = 'apple', 'Apple'
+        elif name.startswith(MAGIC_TRACKPAD):
+            key, label = 'magic-trackpad', 'Magic Trackpad'
         elif name == 'ven_06cb:00-06cb:d01d-touchpad':
             key, label = 'dell', 'Dell'
         else:
@@ -296,7 +307,7 @@ def state_lock():
 def validate_state(state):
     if not isinstance(state, dict) or set(state) != {'version', 'devices'}:
         raise ValueError('Invalid trackpad state structure')
-    if type(state['version']) is not int or state['version'] not in (1, 2, 3, 4):
+    if type(state['version']) is not int or state['version'] not in (1, 2, 3, 4, 5):
         raise ValueError('Unsupported trackpad state version; saved settings were not changed')
     devices = state['devices']
     if not isinstance(devices, dict) or len(devices) > 128:
@@ -434,7 +445,7 @@ def initialize(live):
 
 def snapshot(state, live):
     rows = []
-    for key in sorted(state['devices'], key=lambda k: (k != 'apple', k != 'dell', k)):
+    for key in sorted(state['devices'], key=lambda k: (k != 'apple', k != 'magic-trackpad', k != 'dell', k)):
         group = copy.deepcopy(state['devices'][key])
         group['connected'] = key in live
         rows.append(group)
@@ -443,7 +454,7 @@ def snapshot(state, live):
 
 def migrate(state):
     """The previous panel inherited the driver's default adaptive profile."""
-    if not isinstance(state, dict) or type(state.get('version')) is not int or state['version'] not in (1, 2, 3, 4):
+    if not isinstance(state, dict) or type(state.get('version')) is not int or state['version'] not in (1, 2, 3, 4, 5):
         raise ValueError('Unsupported trackpad state version; saved settings were not changed')
     updated = copy.deepcopy(state)
     for group in updated['devices'].values():
@@ -468,7 +479,21 @@ def migrate(state):
                                                'end': 2 * old['transition'], 'fast': old['fast']})
             if previous['profile'] == 'mac':
                 previous['profile'] = 'custom'
-    updated['version'] = 4
+    # Version 5: a Magic Trackpad shared the built-in Apple pad's group. Each
+    # now keeps a copy of the settings the group had, so nothing feels
+    # different until one of them is changed.
+    apple = updated['devices'].get('apple')
+    magic = [n for n in (apple or {}).get('names', []) if n.startswith(MAGIC_TRACKPAD)]
+    if magic and 'magic-trackpad' not in updated['devices']:
+        split = copy.deepcopy(apple)
+        split.update(id='magic-trackpad', label='Magic Trackpad', names=magic)
+        rest = [n for n in apple['names'] if n not in magic]
+        if rest:
+            apple['names'] = rest
+        else:
+            del updated['devices']['apple']
+        updated['devices']['magic-trackpad'] = split
+    updated['version'] = 5
     return validate_state(updated)
 
 

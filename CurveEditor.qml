@@ -11,6 +11,9 @@ FocusScope {
   required property string fontFamily
   property real uiScale: 1
   property real gainMaximum: 1
+  // This pad's size against the screen, from the recorder: 1 keeps the
+  // Mac-inspired preset as shipped.
+  property real hardwareScale: 1
   readonly property bool curveExceedsRange: draft.curve.fast > gainMaximum
   property var saved: ({ profile: "adaptive", curve: Curve.defaults() })
   property var draft: Curve.copy(saved)
@@ -54,7 +57,7 @@ FocusScope {
     targetShownAt = Date.now()
   }
   function choose(profile) {
-    draft = { profile: profile, curve: profile === "mac" ? Curve.presetForScale(gainMaximum) : Curve.copy(draft.curve) }
+    draft = { profile: profile, curve: profile === "mac" ? Curve.presetFor(gainMaximum, hardwareScale) : Curve.copy(draft.curve) }
   }
   function adjust(handle, value, precise) {
     draft = { profile: "custom", curve: Curve.adjust(draft.curve, handle, value, precise, gainMaximum) }

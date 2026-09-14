@@ -22,7 +22,7 @@ class TrackpadTests(unittest.TestCase):
             replacement = patch.object(m, name, value)
             replacement.start()
             self.addCleanup(replacement.stop)
-        self.groups=m.group_devices([{'name':n} for n in ['ven_06cb:00-06cb:d01d-touchpad','apple-inc.-magic-trackpad','apple-inc.-magic-trackpad-1','usb-mouse']])
+        self.groups=m.group_devices([{'name':n} for n in ['ven_06cb:00-06cb:d01d-touchpad','apple-mtp-multi-touch','bcm5974','usb-mouse']])
         for g in self.groups.values():
             g['settings']={'enabled':True,'sensitivity':0.3 if g['id']=='dell' else 0.1,'scroll_factor':0.2,'natural_scroll':False,'tap_to_click':True,'clickfinger_behavior':True,'disable_while_typing':True}
         self.state={'version':1,'devices':self.groups}
@@ -61,7 +61,7 @@ class TrackpadTests(unittest.TestCase):
         self.assertEqual(m.read_state_file(m.STATE), 'safe')
 
     def test_future_and_malformed_state_is_rejected(self):
-        for state in [dict(self.state, version=5), dict(self.state, version=True),
+        for state in [dict(self.state, version=6), dict(self.state, version=True),
                       dict(self.state, extra='unsupported')]:
             with self.assertRaises(ValueError):
                 m.migrate(state)
@@ -209,6 +209,42 @@ class TrackpadTests(unittest.TestCase):
         self.assertEqual(set(self.groups),{'apple','dell'})
         self.assertEqual(len(self.groups['apple']['names']),2)
 
+    def test_intel_and_t2_macbooks_are_discovered_as_the_builtin_apple_pad(self):
+        t2 = 'apple-inc.-apple-internal-keyboard-/-trackpad'
+        groups = m.group_devices([{'name': n} for n in ['bcm5974', t2, 'usb-mouse']])
+        self.assertEqual(list(groups), ['apple'])
+        self.assertEqual(groups['apple']['names'], ['bcm5974', t2])
+        groups['apple']['settings'] = self.groups['apple']['settings']
+        lua = m.lua_for(groups)
+        self.assertIn('name = "apple-inc.-apple-internal-keyboard-/-trackpad"', lua)
+        self.assertEqual(m.validate_name(t2), t2)
+
+    def test_magic_trackpad_is_its_own_group(self):
+        groups = m.group_devices([{'name': n} for n in ['apple-mtp-multi-touch', 'apple-inc.-magic-trackpad-2', 'apple-inc.-magic-trackpad']])
+        self.assertEqual(set(groups), {'apple', 'magic-trackpad'})
+        self.assertEqual(groups['magic-trackpad']['label'], 'Magic Trackpad')
+        self.assertEqual(len(groups['magic-trackpad']['names']), 2)
+
+    def test_v4_state_splits_magic_trackpad_and_both_keep_their_settings(self):
+        state = m.migrate(self.state)
+        state['version'] = 4
+        apple = state['devices']['apple']
+        apple['names'] = ['apple-mtp-multi-touch', 'apple-inc.-magic-trackpad-2']
+        apple['settings'].update(accel_profile='custom', curve=dict(m.DEFAULT_CURVE, fast=1.2), curve_preset='mac')
+        lines = sorted(m.lua_for(state['devices']).splitlines())
+        updated = m.migrate(state)
+        self.assertEqual(updated['version'], 5)
+        self.assertEqual(updated['devices']['apple']['names'], ['apple-mtp-multi-touch'])
+        magic = updated['devices']['magic-trackpad']
+        self.assertEqual((magic['id'], magic['names']), ('magic-trackpad', ['apple-inc.-magic-trackpad-2']))
+        self.assertEqual(magic['settings'], updated['devices']['apple']['settings'])
+        self.assertEqual(sorted(m.lua_for(updated['devices']).splitlines()), lines, 'every pad feels the same after the split')
+        self.assertEqual(m.migrate(updated), updated)
+        state['devices']['apple']['names'] = ['apple-inc.-magic-trackpad']
+        only_magic = m.migrate(state)
+        self.assertNotIn('apple', only_magic['devices'])
+        self.assertEqual(only_magic['devices']['magic-trackpad']['names'], ['apple-inc.-magic-trackpad'])
+
     def test_lenovo_synaptics_without_touchpad_suffix_excludes_trackpoint(self):
         name = 'synaptics-tm3512-010'
         groups = m.group_devices([{'name': n} for n in [
@@ -218,7 +254,7 @@ class TrackpadTests(unittest.TestCase):
 
     def test_acceleration_migration_preserves_existing_settings(self):
         migrated = m.migrate(self.state)
-        self.assertEqual(migrated['version'], 4)
+        self.assertEqual(migrated['version'], 5)
         for key in self.groups:
             settings = dict(migrated['devices'][key]['settings'])
             self.assertEqual(settings.pop('accel_profile'), 'adaptive')

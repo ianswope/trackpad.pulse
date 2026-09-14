@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -323,6 +324,106 @@ class ServiceTests(unittest.TestCase):
         (tp.STATE / tp.RECORDER_STOPPED_MARKER).touch()
         self.assertFalse(tp.ensure_service()['started'])
         self.assertEqual(started, [])
+
+
+class HardwareTests(unittest.TestCase):
+    """One default does not fit every pad: names, sizes, the preset scale and history, per pad."""
+
+    def test_hyprland_names_and_settings_groups(self):
+        self.assertEqual(tp.hypr_name('ELAN07FB:00 04F3:321A Touchpad'), 'elan07fb:00-04f3:321a-touchpad')
+        self.assertEqual(tp.hypr_name('Apple Inc. Apple Internal Keyboard / Trackpad'), 'apple-inc.-apple-internal-keyboard-/-trackpad')
+        self.assertEqual(tp.settings_group('bcm5974'), 'apple')
+        self.assertEqual(tp.settings_group('Apple Inc. Apple Internal Keyboard / Trackpad'), 'apple')
+        self.assertEqual(tp.settings_group('Apple Inc. Magic Trackpad 2'), 'magic-trackpad')
+        self.assertEqual(tp.settings_group('ELAN07FB:00 04F3:321A Touchpad'), 'elan07fb:00-04f3:321a-touchpad')
+
+    def test_bcm5974_is_found_and_a_pen_tablet_is_not(self):
+        extra = '''
+I: Bus=0003 Vendor=05ac Product=0259 Version=0111
+N: Name="bcm5974"
+H: Handlers=mouse2 event9
+B: PROP=0
+B: KEY=e520 10000 0 0 0 0
+B: ABS=2e0800000000003
+
+I: Bus=0003 Vendor=056a Product=0374 Version=0100
+N: Name="Wacom Intuos S Pen"
+H: Handlers=mouse4 event21
+B: PROP=0
+B: KEY=e521 10000 0 0 0 0
+B: ABS=2e0800000000003
+'''
+        nodes = [p['node'] for p in tp.parse_devices(DiscoveryTests.SAMPLE + extra)]
+        self.assertIn('/dev/input/event9', nodes)
+        self.assertNotIn('/dev/input/event21', nodes)
+
+    def test_a_pad_without_resolution_is_sized_like_libinput_sizes_it(self):
+        axes = {'x': {'min': 0, 'max': 10400, 'res': 0}, 'y': {'min': 0, 'max': 7500, 'res': 0}, 'slot': None, 'pressure': None, 'major': None}
+        p = tp.Pad({'node': '/dev/input/event9', 'name': 'bcm5974', 'sizeMm': [104.0, 75.0]}, axes, 0.0)
+        self.assertAlmostEqual(p.width_mm, 104.0)
+        self.assertAlmostEqual(p.res_x, 100.0)
+
+    def test_udev_size_is_read_from_the_node_database(self):
+        saved = tp.UDEV_DATA
+        with tempfile.TemporaryDirectory() as directory:
+            tp.UDEV_DATA = Path(directory)
+            try:
+                rdev = os.stat('/dev/null').st_rdev
+                (Path(directory) / ('c%d:%d' % (os.major(rdev), os.minor(rdev)))).write_text('E:ID_INPUT_TOUCHPAD=1\nE:ID_INPUT_WIDTH_MM=123\nE:ID_INPUT_HEIGHT_MM=78\n')
+                self.assertEqual(tp.udev_size('/dev/null'), (123.0, 78.0))
+                self.assertIsNone(tp.udev_size('/dev/zero'))
+            finally:
+                tp.UDEV_DATA = saved
+
+    def test_preset_scale_follows_pad_and_screen(self):
+        self.assertEqual(tp.preset_scale(124.0, 1920), 1.0)
+        self.assertAlmostEqual(tp.preset_scale(160.0, 1920), 0.775, places=3)
+        self.assertEqual(tp.preset_scale(60.0, 3840), 2.0, 'clamped')
+        self.assertEqual(tp.preset_scale(0, 1920), 1.0)
+        self.assertEqual(tp.preset_gains(1.0), (0.1875, 1.0))
+
+    def test_preset_gains_match_the_editor(self):
+        cases = [[1.0, 1.0], [1.0, 0.5], [1.0, 1.5], [3.0, 1.3], [0.2, 2.0], [2.0, 0.7]]
+        script = "const c=require('./Curve.js'); console.log(JSON.stringify(JSON.parse(process.argv[1]).map(a=>c.presetFor(a[0],a[1]))))"
+        js = json.loads(subprocess.check_output(['node', '-e', script, json.dumps(cases)], cwd=Path(__file__).parent))
+        for (maximum, scale), curve in zip(cases, js):
+            precision, fast = tp.preset_gains(maximum, scale)
+            self.assertAlmostEqual(precision, curve['precision'], places=3)
+            self.assertAlmostEqual(fast, curve['fast'], places=3)
+
+    def test_first_fit_uses_this_pads_preset_scale(self):
+        current = {'profile': 'adaptive', 'curve': None, 'scrollFactor': 0.4, 'scrollScale': 1.0, 'gainMaximum': 1.0}
+        plain = tp.propose(current, synthetic_sessions(), synthetic_hist(15, 90))
+        wide = tp.propose(dict(current, presetScale=0.5, device='magic-trackpad'), synthetic_sessions(), synthetic_hist(15, 90))
+        self.assertEqual(wide['verdict'], 'first fit')
+        self.assertAlmostEqual(plain['proposal']['curve']['fast'], 1.0)
+        self.assertAlmostEqual(wide['proposal']['curve']['fast'], 0.5)
+        self.assertEqual(wide['device'], 'magic-trackpad')
+
+    def test_history_and_log_are_kept_per_pad(self):
+        saved = tp.STATE
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            try:
+                db = tp.db_open()
+                rec = {'wall': 10.0, 'kind': 'move', 'fingers': 1, 'duration': 0.5, 'dist': 9.0, 'peak': 40.0, 'mean': 18.0, 'dx': 1.0, 'dy': 0.0, 'flag': '', 'ref': 0.0}
+                tp.record_sessions(db, [dict(rec, device='apple'), dict(rec, wall=11.0, device='elan'), dict(rec, wall=5.0)])
+                self.assertEqual([r['ts'] for r in tp.load_sessions(db, 0, 'apple')], [5.0, 10.0], 'unattributed history counts for either pad')
+                self.assertEqual(len(tp.load_sessions(db, 0)), 3)
+                bins = tp.BINS + 1
+                tp.record(db, 50.0, tp.zero_counters(), [3.0] * bins, 'evdev')
+                tp.record(db, 100.0, tp.zero_counters(), [3.0] * bins, 'evdev', {'apple': [1.0] * bins, 'elan': [2.0] * bins})
+                self.assertEqual(tp.load_hist(db, 0, 'elan')[0], 5.0)
+                self.assertEqual(tp.load_hist(db, 0, 'apple')[0], 4.0)
+                self.assertEqual(tp.load_hist(db, 0)[0], 6.0)
+                db.close()
+                log = [{'ts': 1, 'applied': True, 'device': 'apple'}, {'ts': 2, 'applied': True, 'device': 'elan'}]
+                tp.settle(log, {'now': 3.0, 'device': 'apple', 'previous': {'judgement': 'kept', 'reason': 'held', 'after': {}}})
+                self.assertEqual(log[0]['judgement'], 'kept')
+                self.assertNotIn('judgement', log[1])
+                self.assertEqual(len(json.loads((tp.STATE / tp.OPTIMIZE_LOG).read_text())), 2, 'the other pad keeps its rows')
+            finally:
+                tp.STATE = saved
 
 
 class FingerprintTests(unittest.TestCase):

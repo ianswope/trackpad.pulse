@@ -56,7 +56,7 @@ function parseTouchpadDevice(json) {
       if (raw.length === 0 || raw.length > MAX_DEVICE_NAME_CHARS) continue
       if (/[\x00-\x1f\x7f]/.test(raw)) continue
       var name = raw.toLowerCase()
-      if (name === "apple-mtp-multi-touch" || name.indexOf("touchpad") !== -1 || name.indexOf("trackpad") !== -1)
+      if (name === "apple-mtp-multi-touch" || name === "bcm5974" || name.indexOf("touchpad") !== -1 || name.indexOf("trackpad") !== -1)
         return raw
     }
   } catch (e) {}

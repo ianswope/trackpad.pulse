@@ -418,10 +418,11 @@ Panel {
   readonly property var todayHist: root.cursorOnly ? ((today.cursor || {}).hist || []) : (today.hist || [])
   // The curve editor wants a distribution with some weight in it; a fresh day
   // borrows the week until it has half a minute of movement of its own.
-  readonly property var feelHist: Pulse.total(todayHist) >= 30 || !week.hist ? todayHist : week.hist
+  readonly property var feelHist: Pulse.padHist(snap, root.selectedDevice, Pulse.total(todayHist) >= 30 || !week.hist ? todayHist : week.hist)
   readonly property var chart: histories[String(range)] || ({ points: [], seconds: range, now: now, bucket: 60, count: 0, peak: 0, busiest: 0, touches: 0, distance: 0 })
   readonly property var spans: snap.windows || ({})
   readonly property var pads: snap.pads || []
+  readonly property real presetScale: Pulse.presetScale(snap, root.selectedDevice)
   readonly property var readablePads: pads.filter(function(p) { return p.readable })
   readonly property var livePads: live.pads || []
   readonly property var liveFingers: {
@@ -599,7 +600,7 @@ Panel {
   property var proposal: null
   readonly property var optimizeCurrent: ({
     profile: root.pointerFeel.profile, curve: root.pointerFeel.curve, scrollFactor: root.scrollFactor, scrollScale: root.scrollScale,
-    gainMaximum: root.scrollScale, practiceMedianMs: curveEditor.practiceMedianMs })
+    gainMaximum: root.scrollScale, practiceMedianMs: curveEditor.practiceMedianMs, device: root.selectedDevice, presetScale: root.presetScale })
   function requestOptimize() {
     if (pulseProc.running) return
     root.proposal = null
@@ -625,7 +626,7 @@ Panel {
       scrollDebounce.stop()
       root.commitScrollFactor()
     }
-    var entry = { changes: p.changes, evidence: p.evidence, verdict: p.verdict, practiceMedianMs: curveEditor.practiceMedianMs }
+    var entry = { changes: p.changes, evidence: p.evidence, verdict: p.verdict, practiceMedianMs: curveEditor.practiceMedianMs, device: p.device || root.selectedDevice }
     root.proposal = null
     root.hintSeen()
     if (pulseProc.running) { root.actionStatus = "Applied; the log entry will be written on the next pass."; return }
@@ -641,7 +642,7 @@ Panel {
     root.hintSeen()
     root.actionStatus = "Keeping it…"
     pulseProc.mode = "keep"
-    pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-keep", "{}"])
+    pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-keep", JSON.stringify({ device: root.selectedDevice })])
     pulseProc.running = true
   }
   function fmtValue(key, v) {
@@ -1618,6 +1619,7 @@ Panel {
               uiScale: Style.space(100) / 100
               saved: root.pointerFeel
               gainMaximum: root.scrollScale
+              hardwareScale: root.presetScale
               deviceLabel: /touchpad|trackpad/i.test(root.selectedLabel) ? root.selectedLabel : root.selectedLabel + " Trackpad"
               busy: actionProc.running || root.pendingActions.length > 0
               settingsError: root.settingsError

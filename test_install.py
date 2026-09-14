@@ -32,8 +32,8 @@ class InstallationTests(unittest.TestCase):
         self.devices = self.root / 'devices.json'
         self.devices.write_text(json.dumps({'mice': [
             {'name': 'ven_06cb:00-06cb:d01d-touchpad'},
-            {'name': 'apple-inc.-magic-trackpad'},
-            {'name': 'apple-inc.-magic-trackpad-1'}]}))
+            {'name': 'apple-mtp-multi-touch'},
+            {'name': 'bcm5974'}]}))
         fake = self.root / 'hyprctl'
         fake.write_text('#!' + sys.executable + '''
 import json, os, sys
@@ -177,9 +177,33 @@ else:
         self.devices.write_text('{"mice": []}')
         self.assertEqual(self.call('state')['devices'], [])
         self.devices.write_text('{"mice": [{"name": "apple-inc.-magic-trackpad"}]}')
-        self.assertEqual(self.call('state')['devices'][0]['id'], 'apple')
-        self.call('set', 'apple', 'sensitivity', '0.4')
+        self.assertEqual(self.call('state')['devices'][0]['id'], 'magic-trackpad')
+        self.call('set', 'magic-trackpad', 'sensitivity', '0.4')
         self.assertEqual(self.call('state')['devices'][0]['settings']['sensitivity'], 0.4)
+
+    def test_saved_apple_group_with_a_magic_trackpad_splits_on_next_read(self):
+        self.devices.write_text(json.dumps({'mice': [{'name': 'apple-mtp-multi-touch'}, {'name': 'apple-inc.-magic-trackpad-2'}]}))
+        self.call('state')
+        self.call('set', 'apple', 'sensitivity', '-0.3')
+        state_path = self.root / 'state/omarchy/local-touchpads/settings.json'
+        data = json.loads(state_path.read_text())
+        # What a 1.6 install saved: one Apple group holding both pads.
+        magic = data['devices'].pop('magic-trackpad')
+        data['devices']['apple']['names'] += magic['names']
+        data['devices']['apple']['settings']['sensitivity'] = -0.3
+        data['version'] = 4
+        state_path.write_text(json.dumps(data))
+        rows = {d['id']: d for d in self.call('state')['devices']}
+        self.assertEqual(set(rows), {'apple', 'magic-trackpad'})
+        self.assertEqual(rows['magic-trackpad']['names'], ['apple-inc.-magic-trackpad-2'])
+        self.assertEqual(rows['magic-trackpad']['settings'], rows['apple']['settings'])
+        self.assertTrue(rows['magic-trackpad']['connected'])
+        self.assertEqual(json.loads(state_path.read_text())['version'], 5)
+        generated = (self.root / 'state/omarchy/toggles/hypr/zz-local-touchpads.lua').read_text()
+        self.assertEqual(generated.count('sensitivity = -0.3'), 2, 'both pads keep the setting they had')
+        self.call('set', 'magic-trackpad', 'sensitivity', '0.5')
+        rows = {d['id']: d for d in self.call('state')['devices']}
+        self.assertEqual((rows['apple']['settings']['sensitivity'], rows['magic-trackpad']['settings']['sensitivity']), (-0.3, 0.5))
 
     def test_lock_stall_is_bounded_and_next_read_recovers(self):
         self.call('state')
