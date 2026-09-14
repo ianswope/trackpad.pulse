@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'collectors'))
@@ -281,6 +282,47 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('ExecStart=/usr/bin/python3 /x/y/trackpad_pulse.py daemon', text)
         self.assertIn('NoNewPrivileges=yes', text)
         self.assertEqual(json.loads(json.dumps(tp.zero_counters()))['touches'], 0)
+
+
+class ServiceTests(unittest.TestCase):
+    """`omarchy plugin add` runs no installer: the panel calls ensure-service on load."""
+
+    def setUp(self):
+        self.saved = (tp.STATE, tp.service_status, tp.install_service, tp.subprocess.run, os.environ.get('HOME'))
+        self.directory = tempfile.TemporaryDirectory()
+        tp.STATE = Path(self.directory.name)
+        os.environ['HOME'] = self.directory.name
+        self.calls = []
+        tp.subprocess.run = lambda args, **kw: self.calls.append(args) or types.SimpleNamespace(returncode=0, stdout='inactive\n', stderr='')
+
+    def tearDown(self):
+        tp.STATE, tp.service_status, tp.install_service, tp.subprocess.run, home = self.saved
+        os.environ['HOME'] = home
+        self.directory.cleanup()
+
+    def test_stop_leaves_a_marker_and_start_clears_it(self):
+        tp.uninstall_service()
+        self.assertTrue((tp.STATE / tp.RECORDER_STOPPED_MARKER).exists())
+        tp.install_service()
+        self.assertFalse((tp.STATE / tp.RECORDER_STOPPED_MARKER).exists())
+        self.assertTrue((Path(self.directory.name) / '.config/systemd/user' / tp.UNIT_NAME).exists())
+
+    def test_ensure_starts_a_recorder_nobody_started(self):
+        started = []
+        tp.install_service = lambda: started.append(True)
+        for status, expect in (('inactive', True), ('failed', True), ('unknown', True), ('active', False), ('activating', False)):
+            started.clear()
+            tp.service_status = lambda: status
+            self.assertEqual(tp.ensure_service()['started'], expect, status)
+            self.assertEqual(bool(started), expect, status)
+
+    def test_ensure_leaves_a_stopped_recorder_stopped(self):
+        started = []
+        tp.install_service = lambda: started.append(True)
+        tp.service_status = lambda: 'inactive'
+        (tp.STATE / tp.RECORDER_STOPPED_MARKER).touch()
+        self.assertFalse(tp.ensure_service()['started'])
+        self.assertEqual(started, [])
 
 
 class FingerprintTests(unittest.TestCase):

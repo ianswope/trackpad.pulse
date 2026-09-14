@@ -56,6 +56,9 @@ AUTO_OFF_MARKER = 'auto-off'
 # a brief, short touch on a pad that sat idle; a rest is a slow, short drift
 # that began in the thumb strip at the bottom or the palm strips at the sides.
 STRAY_GUARD_MARKER = 'stray-guard'
+# Left by Stop the recorder, so the panel's start-on-load leaves a stopped
+# recorder stopped. Start the recorder removes it.
+RECORDER_STOPPED_MARKER = 'recorder-stopped'
 STRAY_BRUSH_S = 0.25
 STRAY_BRUSH_MM = 4.0
 STRAY_COLD_S = 2.0
@@ -2121,6 +2124,7 @@ def unit_text(script):
 
 
 def install_service():
+    (STATE / RECORDER_STOPPED_MARKER).unlink(missing_ok=True)
     units = Path.home() / '.config/systemd/user'
     units.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).resolve()
@@ -2133,6 +2137,7 @@ def install_service():
 
 
 def uninstall_service():
+    (STATE / RECORDER_STOPPED_MARKER).touch()
     units = Path.home() / '.config/systemd/user'
     subprocess.run(['systemctl', '--user', 'disable', '--now', UNIT_NAME], capture_output=True, timeout=30, check=False)
     (units / UNIT_NAME).unlink(missing_ok=True)
@@ -2143,6 +2148,19 @@ def uninstall_service():
 def service_status():
     result = subprocess.run(['systemctl', '--user', 'is-active', UNIT_NAME], capture_output=True, text=True, timeout=10, check=False)
     return result.stdout.strip() or 'unknown'
+
+
+def ensure_service():
+    """Start the recorder if nothing has. `omarchy plugin add` publishes the
+    panel but runs no installer, so on a fresh machine the recorder stayed
+    offline until someone found Start the recorder. A deliberate Stop wins."""
+    status = service_status()
+    if (STATE / RECORDER_STOPPED_MARKER).exists():
+        return {'service': status, 'started': False, 'reason': 'stopped by you'}
+    if status in ('active', 'activating', 'reloading'):
+        return {'service': status, 'started': False}
+    install_service()
+    return {'service': service_status(), 'started': True}
 
 
 def privileged(script, what):
@@ -2204,7 +2222,7 @@ def one_shot():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
+    parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'ensure-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
                                            'optimize', 'optimize-applied', 'optimize-keep', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
                                            'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'stray-guard-on', 'stray-guard-off', 'open-fullscreen'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
@@ -2265,7 +2283,7 @@ def main():
             value = theme_step(args.action[6:])
         else:
             value = {'snapshot': one_shot, 'install-service': install_service, 'uninstall-service': uninstall_service,
-                     'grant-access': grant_access, 'revoke-access': revoke_access}.get(args.action, lambda: visit(args.link))()
+                     'ensure-service': ensure_service, 'grant-access': grant_access, 'revoke-access': revoke_access}.get(args.action, lambda: visit(args.link))()
         print(json.dumps(value))
     except Exception as e:  # noqa: BLE001 - every failure is reported as JSON for the panel
         print(json.dumps({'error': str(e)}))

@@ -680,6 +680,14 @@ Panel {
     onTriggered: { root.now = Date.now() / 1000; if (root.stale) { snapshotFile.reload(); historyFile.reload() } }
   }
   Timer { id: reoptimize; interval: 200; onTriggered: root.requestOptimize() }
+  // `omarchy plugin add` runs no installer, so a fresh machine had no
+  // recorder until someone found Start the recorder. Once per load, a snapshot
+  // still stale after a few seconds asks the recorder to start itself; it
+  // leaves one you stopped alone.
+  Timer {
+    id: ensureRecorder; interval: 5000
+    onTriggered: { if (!root.stale) return; if (pulseProc.running) { restart(); return } root.runPulse("ensure-service", [], "ensure") }
+  }
   Process {
     id: pulseProc
     property string mode: "status"
@@ -692,6 +700,7 @@ Panel {
           else if (pulseProc.mode === "report" && !r.error) { root.reportData = r; root.actionStatus = "" }
           else if (pulseProc.mode === "keep" && !r.error) { root.actionStatus = r.message || "Kept."; reoptimize.start() }
           else if (pulseProc.mode === "gestures" && !r.error) { if (r.gestures) root.setSetting("gestures", r.gestures); root.actionStatus = r.message || "Gestures applied." }
+          else if (pulseProc.mode === "ensure") { if (r.error) root.actionStatus = r.error }
           else root.actionStatus = r.error || r.message || "Done"
         } catch (e) { root.actionStatus = "The recorder helper did not answer." }
         pulseProc.mode = "status"
@@ -722,7 +731,7 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: { refresh(); ensureRecorder.start() }
 
   onOpenedChanged: {
     if (opened) {

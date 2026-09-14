@@ -2,6 +2,11 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.6.1 — 2026-09-14
+
+- **The recorder starts on a fresh install.** `omarchy plugin add … --enable` publishes the panel but runs no installer, so on any machine installed that way the bar showed RECORDER OFFLINE and counted nothing until someone found **Start the recorder**. Once per load, if the snapshot is still stale after five seconds, the panel now asks the recorder to start itself. **Stop the recorder** leaves a `recorder-stopped` marker in the state dir and a stopped recorder stays stopped; **Start the recorder** clears it. No setting is touched.
+- Recorder: `ensure-service` action.
+
 ## 1.6.0 — 2026-09-14
 
 - **Stray touches.** The recorder now names touches that look accidental and moved the cursor: a *brush*, shorter than 0.25 s and 4 mm on a pad that had sat idle for 2 s, and a *rest*, a slow drift under 10 mm that began in the bottom thumb strip or a side edge. A click or a second finger means it was meant. Each session now records where it started, the idle gap before it, whether it clicked and how far the cursor moved. Counted on the Overview strip and the tooltip, kept per day, and mapped on the Touch lab (where they start).

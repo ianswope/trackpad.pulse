@@ -181,7 +181,7 @@ Nothing leaves the machine. History lives in `~/.local/state/trackpad-pulse/`, t
 omarchy plugin add https://github.com/nixfred/trackpad.pulse.git --enable
 ```
 
-The widget appears on the right of the bar as soon as a trackpad is detected. Open it: the Overview offers **Start the recorder**, which installs and enables `trackpad-pulse.service` in your user scope. Or install everything in one go from a checkout:
+The widget appears on the right of the bar as soon as a trackpad is detected. The first time it loads it installs and starts `trackpad-pulse.service` in your user scope, so the counts begin on their own. **Stop the recorder** on the Touch lab stops it for good, until you press **Start the recorder**. Or install everything in one go from a checkout:
 
 ```sh
 git clone https://github.com/nixfred/trackpad.pulse.git

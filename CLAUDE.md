@@ -114,6 +114,11 @@ restart script gives up after two seconds while a big shell takes ten, so ping
 drop the widget into the center section; put it back with
 `omarchy-shell shell moveBarWidget nixfred.trackpad-pulse '{"section":"right","index":3}'`.
 
+`omarchy plugin add` runs no installer. The panel covers that: once per load,
+a snapshot still stale after five seconds runs `ensure-service`, which starts
+the unit unless the `recorder-stopped` marker (left by Stop the recorder) is
+there. Machines installed that way sat at RECORDER OFFLINE before 1.6.1.
+
 A recorder release that adds a counter must merge over the previous release's
 `today.json` (`_load_today` does); the 1.1.0 recorder crash-looped on exactly
 that. The daemon's loop survives a bad tick now, but the journal
