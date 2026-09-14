@@ -42,6 +42,8 @@ ShellRoot {
     function status() { return JSON.stringify({opened: opened, active: active, chooseMode: chooseMode, enabled: enabled}) }
     function showPage(key) { for (var i = 0; i < pages.length; i++) if (pages[i].key === key) { chooseMode = false; active = key; return true } actionStatus = "No such page: " + key; return false }
     function setTouchpadEnabled(on) { enabled = on }
+    property bool optimized: false
+    function requestOptimize() { optimized = true; active = "feel" }
   }
 ''' + handler + '''
   IpcHandler {
@@ -50,6 +52,7 @@ ShellRoot {
     function active(): string { return root.active }
     function chooseMode(): bool { return root.chooseMode }
     function enabled(): bool { return root.enabled }
+    function optimized(): bool { return root.optimized }
   }
 }
 ''')
@@ -83,9 +86,10 @@ ShellRoot {
             check('chooser', 'true', probe='chooseMode'); check('open', 'false', probe='chooseMode')
             check('page', 'lab', 'lab', probe='active'); check('page', 'lab', 'bogus', probe='active')
             check('enable', 'false', 'false', probe='enabled'); check('enable', 'true', 'true', probe='enabled')
+            check('optimize', 'true', probe='optimized'); check('optimize', 'feel', probe='active')
             status = ipc(target, 'status')
-            assert status.returncode == 0 and json.loads(status.stdout)['active'] == 'lab', status.stdout
-            print('Trackpad Pulse IPC verified in an isolated offscreen Quickshell instance: open, close, show, hide, toggle, chooser, page, enable and status.')
+            assert status.returncode == 0 and json.loads(status.stdout)['active'] == 'feel', status.stdout
+            print('Trackpad Pulse IPC verified in an isolated offscreen Quickshell instance: open, close, show, hide, toggle, chooser, page, enable, optimize and status.')
         finally:
             server.terminate()
             try:

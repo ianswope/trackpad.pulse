@@ -2,6 +2,17 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.1.0 — 2026-09-14
+
+**Optimize for my hand.** The recorder now keeps one row per touch session for seven days and names the two fingerprints of a wrong curve as sessions end: an **overshoot correction** (a long move answered at once by a short move back) and a **re-stroke** (a long move continued at once in the same direction), plus their scroll equivalents.
+
+- New button on Pointer feel. It fits Start to the speed below which 45% of your movement happens and End to the 90th percentile, then nudges Fast swipes, Precision and Scroll speed by at most 10% a pass when the correction or re-stroke rate in that speed band runs high. Each change comes with its reason and the evidence. Nothing changes until Apply, which goes through Trackpad Plus's journalled path, so Restore previous still works.
+- Every applied pass is logged; the next pass judges it by the same rates since it was applied and by the target-practice time, which the curve editor now measures (median seconds from a target appearing to the click).
+- A System or Flat profile gets a first fit: a custom curve from the Mac-inspired gains with your Start and End.
+- Thin data fits the shape but withholds the gain nudges and says so. Both signals running high at once cancel and say so. A raise that would pass the chart ceiling points at Device scale instead.
+- IPC: `optimize` opens Pointer feel with a fresh proposal.
+- Recorder: `optimize` and `optimize-applied` actions; `sessions` table; `longMoves`, `corrections`, `restrokes`, `scrollCorrections`, `scrollRestrokes` counters.
+
 ## 1.0.0 — 2026-09-14
 
 First release of Trackpad Pulse, forked from Trackpad Plus 2026.09.13.1.

@@ -27,6 +27,16 @@ FocusScope {
   property bool numberPending: false
   property int hits: 0
   property int targetIndex: 0
+  // Time from a target appearing to the click that hits it, for the last
+  // targets of this visit. The optimizer logs the median beside each pass, so
+  // the next pass can say whether the curve got you there faster.
+  property var practiceTimes: []
+  property real targetShownAt: 0
+  readonly property real practiceMedianMs: {
+    var a = (practiceTimes || []).slice().sort(function(x, y) { return x - y })
+    return a.length ? a[Math.floor(a.length / 2)] : 0
+  }
+  onTargetIndexChanged: targetShownAt = Date.now()
   readonly property bool custom: draft.profile === "mac" || draft.profile === "custom"
   readonly property bool dirty: JSON.stringify(draft) !== JSON.stringify(saved)
   signal applyRequested(var value)
@@ -40,6 +50,8 @@ FocusScope {
     draft = Curve.copy(saved)
     numberPending = false
     hits = 0
+    practiceTimes = []
+    targetShownAt = Date.now()
   }
   function choose(profile) {
     draft = { profile: profile, curve: profile === "mac" ? Curve.presetForScale(gainMaximum) : Curve.copy(draft.curve) }
@@ -404,7 +416,7 @@ FocusScope {
       radius: 6 * editor.uiScale
       color: Qt.alpha(editor.foreground, 0.035)
       border.color: Qt.alpha(editor.foreground, 0.15)
-      Label { x: 10 * editor.uiScale; y: 8 * editor.uiScale; text: "Target practice · " + editor.hits + " hits"; font.pixelSize: 11 * editor.uiScale; opacity: 0.6 }
+      Label { x: 10 * editor.uiScale; y: 8 * editor.uiScale; text: "Target practice · " + editor.hits + " hits" + (editor.practiceMedianMs > 0 ? " · median " + (editor.practiceMedianMs / 1000).toFixed(2) + " s to target" : ""); font.pixelSize: 11 * editor.uiScale; opacity: 0.6 }
       Rectangle {
         objectName: "practiceTarget"
         readonly property var positions: [[0.12, 0.65], [0.85, 0.50], [0.79, 0.72], [0.2, 0.42], [0.25, 0.68], [0.65, 0.45]]
@@ -417,7 +429,17 @@ FocusScope {
         color: Qt.alpha(editor.accent, 0.2)
         border.color: editor.accent
         border.width: 2
-        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { editor.hits++; editor.targetIndex++ } }
+        MouseArea {
+          anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            if (editor.targetShownAt > 0) {
+              var times = (editor.practiceTimes || []).slice()
+              times.push(Date.now() - editor.targetShownAt)
+              editor.practiceTimes = times.slice(-20)
+            }
+            editor.hits++; editor.targetIndex++
+          }
+        }
       }
     }
   }

@@ -63,6 +63,23 @@ So the editor draws the recorded distribution as bars under the curve, and the p
 
 Everything else on this page is David Fano's editor exactly as he built it: System, Mac-inspired, Flat and Custom profiles, four draggable handles with spinners, keyboard steps, target practice, Apply & try, and Restore previous.
 
+### Optimize for my hand
+
+<div align="center">
+<img src="assets/screenshots/optimize.png" width="900" alt="The Optimize for my hand card: proposed Start and End with the reasons, the overshoot and re-stroke evidence, and Apply this / Dismiss">
+</div>
+
+A wrong curve leaves fingerprints, and the recorder reads them. A long move answered at once by a short move back the other way is an **overshoot correction**: the cursor went too far at that speed. A long move continued at once in the same direction is a **re-stroke**: the pad ran out before the cursor arrived. Two-finger scrolls have the same two tells.
+
+Press **Optimize for my hand** and the recorder reads the week since your last applied pass and proposes:
+
+- **Start** at the speed below which 45% of your movement happens, **End** at the 90th percentile. The shape of the curve fitted to the shape of your hand.
+- **Fast swipes** down 8% when more than a fifth of your fast moves end in an overshoot, or up 10% when more than an eighth of your long moves are re-strokes. **Precision** down 8% when slow moves keep overshooting. **Scroll speed** the same way from reversals and repeats.
+
+Every change comes with its reason and the numbers behind it. Nothing changes until you press **Apply this**, which goes through Trackpad Plus's journalled path, so **Restore previous** still undoes it. Each pass is bounded, so the loop converges instead of lurching, and each applied pass is logged: the next one reports whether the last one helped, by the same rates since it was applied and by the target-practice time the editor now measures. Thin data fits the shape and withholds the gains, and says so.
+
+It cannot tune taps, natural scrolling or the right-click switch; those are preferences with no signal in the touch stream.
+
 ---
 
 ## Controls

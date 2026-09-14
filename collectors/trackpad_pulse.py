@@ -98,7 +98,23 @@ LIVE_INTERVAL = 1 / 20
 RETENTION = 7 * 86400
 
 COUNTERS = ('touches', 'taps', 'taps2', 'taps3', 'clicks', 'rightClicks', 'moves', 'scrolls', 'pinches',
-            'swipes3', 'swipes4', 'palms', 'distance', 'scroll', 'active', 'moving', 'frames')
+            'swipes3', 'swipes4', 'palms', 'distance', 'scroll', 'active', 'moving', 'frames',
+            'longMoves', 'corrections', 'restrokes', 'scrollCorrections', 'scrollRestrokes')
+
+# A wrong curve leaves fingerprints. An overshoot is a move followed at once by
+# a short move back the other way; a re-stroke is a long move followed at once
+# by another in the same direction, because the first ran out of pad. The
+# optimizer reads their rates per speed band; nothing here changes a setting.
+CORRECTION_GAP = 0.45      # s between lift and the correcting touch
+CORRECTION_MAX_MM = 4.0    # the correction itself is short
+LONG_MOVE_MM = 6.0         # a move worth judging
+RESTROKE_GAP = 0.6
+SCROLL_GAP = 0.6
+SCROLL_LONG_MM = 10.0
+OPTIMIZE_LOG = 'optimize-log.json'
+# Gain nudges per pass, so the loop converges instead of lurching.
+NUDGE_DOWN = 0.92
+NUDGE_UP = 1.10
 
 
 def zero_counters():
@@ -213,6 +229,8 @@ class Pad:
         self.buttons = {}
         self.touch = False
         self.session = None
+        self.sessions = []
+        self.prev = None
         self.counts = zero_counters()
         self.hist = [0.0] * (BINS + 1)
         self.peak = 0.0
@@ -306,11 +324,19 @@ class Pad:
             if self.hz:
                 self.hz_seen = self.hz
             if self.session is None:
-                self.session = {'start': now, 'max': 0, 'dist': 0.0, 'palm': False, 'clicked': False, 'gap0': None, 'gapMax': 0.0}
+                lead = active[0]
+                self.session = {'start': now, 'max': 0, 'dist': 0.0, 'palm': False, 'clicked': False, 'gap0': None, 'gapMax': 0.0,
+                                'peak': 0.0, 'lead': next((k for k, s in self.slots.items() if s is lead), None),
+                                'x0': lead['x'] / self.res_x, 'y0': lead['y'] / self.res_y, 'x1': lead['x'] / self.res_x, 'y1': lead['y'] / self.res_y}
                 self.counts['touches'] += 1
             ses = self.session
             ses['max'] = max(ses['max'], fingers)
             ses['dist'] += dist
+            ses['peak'] = max(ses['peak'], speed)
+            leader = self.slots.get(ses['lead'])
+            if leader is None or leader['id'] < 0 or leader['x'] is None:
+                leader = active[0]
+            ses['x1'], ses['y1'] = leader['x'] / self.res_x, leader['y'] / self.res_y
             if any(s['tool'] == MT_TOOL_PALM for s in active):
                 ses['palm'] = True
             if fingers == 2:
@@ -355,6 +381,17 @@ class Pad:
         kind = classify(ses, now)
         self.counts[{'tap': 'taps', 'tap2': 'taps2', 'tap3': 'taps3', 'move': 'moves', 'scroll': 'scrolls', 'pinch': 'pinches',
                      'swipe3': 'swipes3', 'swipe4': 'swipes4', 'palm': 'palms'}.get(kind, 'moves')] += 1
+        rec = {'wall': time.time(), 'start': ses['start'], 'end': now, 'kind': kind, 'fingers': ses['max'],
+               'duration': round(now - ses['start'], 3), 'dist': round(ses['dist'], 2), 'peak': round(ses['peak'], 1),
+               'mean': round(ses['dist'] / max(0.01, now - ses['start']), 1),
+               'dx': round(ses['x1'] - ses['x0'], 2), 'dy': round(ses['y1'] - ses['y0'], 2), 'flag': '', 'ref': 0.0}
+        rec['flag'], rec['ref'] = flag_session(rec, self.prev)
+        if kind == 'move' and rec['dist'] >= LONG_MOVE_MM:
+            self.counts['longMoves'] += 1
+        if rec['flag']:
+            self.counts[rec['flag'] + 's'] += 1
+        self.sessions.append(rec)
+        self.prev = rec
         self.dirty = True
 
     def tick(self, now):
@@ -383,6 +420,39 @@ class Pad:
                   'pressure': bool(self.pressure_axis), 'major': bool(self.axes.get('major')),
                   'hz': round(self.hz_seen), 'hzNow': round(self.hz), 'fingers': self.fingers, 'speed': round(self.speed, 1), 'lastTouch': self.last_touch})
         return f
+
+
+def _cos(a, b):
+    la, lb = math.hypot(a['dx'], a['dy']), math.hypot(b['dx'], b['dy'])
+    if la < 0.5 or lb < 0.5:
+        return None
+    return (a['dx'] * b['dx'] + a['dy'] * b['dy']) / (la * lb)
+
+
+def flag_session(rec, prev):
+    """Name what this session says about the one before it, or nothing.
+
+    Returns (flag, reference speed): 'correction' when a long move is answered
+    at once by a short move the other way (the curve moved the cursor too far
+    at that speed), 'restroke' when a long move is continued at once in the
+    same direction (not far enough), and the scroll equivalents.
+    """
+    if not prev:
+        return '', 0.0
+    gap = rec['start'] - prev['end']
+    if rec['kind'] == 'move' and prev['kind'] == 'move':
+        c = _cos(rec, prev)
+        if c is not None and gap < CORRECTION_GAP and rec['dist'] < CORRECTION_MAX_MM and prev['dist'] >= LONG_MOVE_MM and c < -0.3:
+            return 'correction', prev['peak']
+        if c is not None and gap < RESTROKE_GAP and rec['dist'] >= LONG_MOVE_MM and prev['dist'] >= LONG_MOVE_MM and c > 0.7:
+            return 'restroke', prev['peak']
+    if rec['kind'] == 'scroll' and prev['kind'] == 'scroll' and gap < SCROLL_GAP and abs(rec['dy']) >= 0.5 and abs(prev['dy']) >= 0.5:
+        same = (rec['dy'] > 0) == (prev['dy'] > 0)
+        if not same and rec['dist'] < prev['dist'] * 0.5:
+            return 'scrollCorrection', prev['peak']
+        if same and rec['dist'] >= SCROLL_LONG_MM and prev['dist'] >= SCROLL_LONG_MM:
+            return 'scrollRestroke', prev['peak']
+    return '', 0.0
 
 
 def classify(ses, now):
@@ -519,7 +589,34 @@ def db_open():
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('CREATE TABLE IF NOT EXISTS minutes (ts REAL PRIMARY KEY, touches INTEGER, taps INTEGER, clicks INTEGER, '
                'distance REAL, scroll REAL, swipes INTEGER, palms INTEGER, active REAL, peak REAL, hist TEXT, source TEXT, boot TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS sessions (ts REAL, kind TEXT, fingers INTEGER, duration REAL, dist REAL, '
+               'peak REAL, mean REAL, dx REAL, dy REAL, flag TEXT, ref REAL)')
+    db.execute('CREATE INDEX IF NOT EXISTS sessions_ts ON sessions (ts)')
     return db
+
+
+def record_sessions(db, recs):
+    if not recs:
+        return
+    db.executemany('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                   [(r['wall'], r['kind'], r['fingers'], r['duration'], r['dist'], r['peak'], r['mean'], r['dx'], r['dy'], r['flag'], r['ref']) for r in recs])
+    db.commit()
+
+
+def load_sessions(db, since):
+    keys = ('ts', 'kind', 'fingers', 'duration', 'dist', 'peak', 'mean', 'dx', 'dy', 'flag', 'ref')
+    return [dict(zip(keys, row)) for row in db.execute('SELECT ts,kind,fingers,duration,dist,peak,mean,dx,dy,flag,ref FROM sessions WHERE ts >= ? ORDER BY ts', (since,))]
+
+
+def load_hist(db, since):
+    hist = [0.0] * (BINS + 1)
+    for (raw,) in db.execute('SELECT hist FROM minutes WHERE ts >= ?', (since,)):
+        try:
+            for i, v in enumerate(json.loads(raw)[:BINS + 1]):
+                hist[i] += v
+        except (ValueError, TypeError):
+            pass
+    return hist
 
 
 def record(db, ts, counts, hist, source):
@@ -530,6 +627,7 @@ def record(db, ts, counts, hist, source):
                 counts.get('active', 0.0), counts.get('peak', 0.0), json.dumps([round(v, 3) for v in hist]), source,
                 read('/proc/sys/kernel/random/boot_id').strip()))
     db.execute('DELETE FROM minutes WHERE ts < ?', (ts - RETENTION,))
+    db.execute('DELETE FROM sessions WHERE ts < ?', (ts - RETENTION,))
     db.commit()
 
 
@@ -577,6 +675,7 @@ class Recorder:
         self.last_snapshot = 0.0
         self.last_history = 0.0
         self.live_clear_pending = False
+        self.pending_sessions = []
 
     def _load_today(self):
         try:
@@ -654,6 +753,9 @@ class Recorder:
             if not pad.dirty:
                 continue
             pad.dirty = False
+            if pad.sessions:
+                self.pending_sessions.extend(pad.sessions)
+                pad.sessions = []
             counts, hist = pad.take()
             for k, v in counts.items():
                 self.minute['counts'][k] += v
@@ -748,9 +850,183 @@ class Recorder:
                 self.roll(now)
                 interval = 1.0 if (self.touching() or now - self.cursor.last_move < 2.0) else 5.0
                 if now - self.last_snapshot >= interval:
+                    try:
+                        record_sessions(self.db, self.pending_sessions)
+                        self.pending_sessions = []
+                    except sqlite3.Error as e:
+                        print('Trackpad Pulse: sessions: ' + str(e), flush=True)
                     atomic(STATE, 'snapshot.json', self.snapshot(now))
                     atomic(STATE, 'today.json', self.today)
                     self.last_snapshot = now
+
+
+# ---- the optimizer --------------------------------------------------------
+def percentile(hist, fraction):
+    total = sum(hist)
+    if total <= 0:
+        return 0.0
+    acc = 0.0
+    for i, v in enumerate(hist):
+        acc += v
+        if acc / total >= fraction:
+            return (i + 1) * BIN_MM_S
+    return len(hist) * BIN_MM_S
+
+
+def rates(sessions, start_mm, end_mm):
+    """Overshoot and re-stroke rates, overall and per speed band of the move they answer."""
+    moves = [s for s in sessions if s['kind'] == 'move']
+    long_moves = [s for s in moves if s['dist'] >= LONG_MOVE_MM]
+    corrections = [s for s in moves if s['flag'] == 'correction']
+    restrokes = [s for s in moves if s['flag'] == 'restroke']
+    scrolls = [s for s in sessions if s['kind'] == 'scroll']
+    fast = [s for s in long_moves if s['peak'] >= end_mm]
+    slow = [s for s in long_moves if s['peak'] < start_mm]
+
+    def rate(n, d):
+        return n / d if d else 0.0
+    return {'sessions': len(sessions), 'moves': len(moves), 'longMoves': len(long_moves), 'corrections': len(corrections), 'restrokes': len(restrokes),
+            'correctionRate': rate(len(corrections), len(long_moves)), 'restrokeRate': rate(len(restrokes), len(long_moves)),
+            'fastMoves': len(fast), 'fastCorrectionRate': rate(sum(1 for s in corrections if s['ref'] >= end_mm), len(fast)),
+            'slowMoves': len(slow), 'slowCorrectionRate': rate(sum(1 for s in corrections if s['ref'] < start_mm), len(slow)),
+            'scrolls': len(scrolls), 'scrollReversalRate': rate(sum(1 for s in scrolls if s['flag'] == 'scrollCorrection'), len(scrolls)),
+            'scrollRestrokeRate': rate(sum(1 for s in scrolls if s['flag'] == 'scrollRestroke'), len(scrolls))}
+
+
+def propose(current, sessions, hist, log=None, now=None):
+    """What to change and why. Pure: settings in, proposal out, nothing applied.
+
+    current: {profile, curve:{precision,start,end,fast}, scrollFactor (slider 0.01..1),
+              scrollScale, gainMaximum}. Start/End are in the editor's 0..4 units.
+    """
+    now = time.time() if now is None else now
+    curve = dict(current.get('curve') or {'precision': 0.3, 'start': 0.8, 'end': 2.8, 'fast': 1.6})
+    profile = current.get('profile', 'adaptive')
+    custom = profile in ('custom', 'mac')
+    gain_max = float(current.get('gainMaximum') or current.get('scrollScale') or 1)
+    scroll = float(current.get('scrollFactor') or 0.4)
+    moving = sum(hist)
+    p45, p50, p90 = percentile(hist, 0.45), percentile(hist, 0.5), percentile(hist, 0.9)
+    start_mm = curve['start'] * MM_PER_UNIT_MS if custom else p45
+    end_mm = curve['end'] * MM_PER_UNIT_MS if custom else p90
+    r = rates(sessions, start_mm, end_mm)
+    changes, notes = [], []
+    proposal = {'curve': dict(curve), 'scrollFactor': scroll, 'profile': 'custom' if custom else profile}
+
+    enough = moving >= 300 and r['moves'] >= 200
+    confidence = 'high' if moving >= 1800 and r['longMoves'] >= 600 else 'medium' if enough else 'low'
+
+    # 1. The shape: Start where 45% of movement is slower, End at the 90th percentile.
+    if moving > 0:
+        new_start = round(min(3.6, max(0.0, p45 / MM_PER_UNIT_MS)), 2)
+        new_end = round(min(4.0, max(new_start + 0.2, p90 / MM_PER_UNIT_MS)), 2)
+        if not custom:
+            base = {'precision': 0.3, 'start': new_start, 'end': new_end, 'fast': 1.6}
+            factor = min(1.0, gain_max / base['fast'])
+            base['precision'] = max(0.01, round(base['precision'] * factor, 4))
+            base['fast'] = round(base['fast'] * factor, 4)
+            proposal['curve'] = base
+            proposal['profile'] = 'custom'
+            changes.append({'key': 'profile', 'label': 'Profile', 'from': profile, 'to': 'custom',
+                            'reason': 'A custom curve is the only place Start and End exist; gains start from the Mac-inspired preset.'})
+            changes.append({'key': 'start', 'label': 'Start', 'from': None, 'to': new_start, 'reason': '45%% of your movement is slower than %.0f mm/s; below that the curve stays at precision gain.' % p45})
+            changes.append({'key': 'end', 'label': 'End', 'from': None, 'to': new_end, 'reason': '90%% of your movement is slower than %.0f mm/s; the fastest tenth gets full gain.' % p90})
+        else:
+            if abs(new_start - curve['start']) >= 0.02:
+                changes.append({'key': 'start', 'label': 'Start', 'from': curve['start'], 'to': new_start, 'reason': '45%% of your movement is slower than %.0f mm/s; Start sits there so half of what you do stays precise.' % p45})
+                proposal['curve']['start'] = new_start
+            if abs(new_end - curve['end']) >= 0.02:
+                changes.append({'key': 'end', 'label': 'End', 'from': curve['end'], 'to': new_end, 'reason': '90%% of your movement is slower than %.0f mm/s; only the fastest tenth needs full gain.' % p90})
+                proposal['curve']['end'] = new_end
+            if proposal['curve']['end'] < proposal['curve']['start'] + 0.2:
+                proposal['curve']['end'] = round(min(4.0, proposal['curve']['start'] + 0.2), 2)
+
+    # 2. The gains, from the fingerprints, one bounded nudge at a time.
+    if custom and enough:
+        fast_up = r['restrokeRate'] > 0.12 and r['longMoves'] >= 50
+        fast_down = r['fastCorrectionRate'] > 0.20 and r['fastMoves'] >= 30
+        if fast_up and fast_down:
+            notes.append('Re-strokes and overshoots after fast moves both run high (%.0f%% and %.0f%%); they cancel, so Fast swipes is left alone this pass.' % (r['restrokeRate'] * 100, r['fastCorrectionRate'] * 100))
+        elif fast_down:
+            new_fast = round(max(curve['precision'], curve['fast'] * NUDGE_DOWN), 4)
+            changes.append({'key': 'fast', 'label': 'Fast swipes', 'from': curve['fast'], 'to': new_fast, 'reason': '%.0f%% of fast moves were answered by an overshoot correction; the cursor is going too far at speed.' % (r['fastCorrectionRate'] * 100)})
+            proposal['curve']['fast'] = new_fast
+        elif fast_up:
+            new_fast = round(curve['fast'] * NUDGE_UP, 4)
+            if new_fast > gain_max:
+                notes.append('%.0f%% of long moves were re-strokes, but Fast swipes is already at the %.2f× ceiling; raise Device scale to go further.' % (r['restrokeRate'] * 100, gain_max))
+            else:
+                changes.append({'key': 'fast', 'label': 'Fast swipes', 'from': curve['fast'], 'to': new_fast, 'reason': '%.0f%% of long moves were re-strokes: the pad ran out before the cursor arrived.' % (r['restrokeRate'] * 100)})
+                proposal['curve']['fast'] = new_fast
+        if r['slowCorrectionRate'] > 0.25 and r['slowMoves'] >= 30:
+            new_prec = round(max(0.01, curve['precision'] * NUDGE_DOWN), 4)
+            changes.append({'key': 'precision', 'label': 'Precision', 'from': curve['precision'], 'to': new_prec, 'reason': '%.0f%% of slow moves were followed by a correction; fine work is overshooting.' % (r['slowCorrectionRate'] * 100)})
+            proposal['curve']['precision'] = new_prec
+        if proposal['curve']['fast'] < proposal['curve']['precision']:
+            proposal['curve']['fast'] = proposal['curve']['precision']
+
+    # 3. Scroll speed, same two signals.
+    if r['scrolls'] >= 40:
+        if r['scrollReversalRate'] > 0.25:
+            new_scroll = round(max(0.01, scroll * NUDGE_DOWN), 2)
+            changes.append({'key': 'scroll', 'label': 'Scroll speed', 'from': scroll, 'to': new_scroll, 'reason': '%.0f%% of scrolls were reversed at once; content is flying past.' % (r['scrollReversalRate'] * 100)})
+            proposal['scrollFactor'] = new_scroll
+        elif r['scrollRestrokeRate'] > 0.30:
+            new_scroll = round(min(1.0, scroll * NUDGE_UP), 2)
+            changes.append({'key': 'scroll', 'label': 'Scroll speed', 'from': scroll, 'to': new_scroll, 'reason': '%.0f%% of scrolls were immediately repeated in the same direction; each one is not going far enough.' % (r['scrollRestrokeRate'] * 100)})
+            proposal['scrollFactor'] = new_scroll
+
+    # 4. What the last pass did, judged by the same rates since it was applied.
+    previous = None
+    applied = [e for e in (log or []) if e.get('applied')]
+    if applied:
+        last = applied[-1]
+        after = rates([s for s in sessions if s['ts'] >= last['ts']], start_mm, end_mm)
+        before = last.get('evidence') or {}
+        previous = {'ts': last['ts'], 'changes': last.get('changes', []), 'before': before, 'after': after,
+                    'practiceBefore': last.get('practiceMedianMs'), 'practiceAfter': current.get('practiceMedianMs')}
+
+    if not changes:
+        verdict = 'nothing to change' if enough else 'nothing to change yet'
+    elif not custom:
+        verdict = 'first fit'
+    else:
+        verdict = 'fit' if all(c['key'] in ('start', 'end') for c in changes) else 'nudge'
+    message = ('%.0f minutes of movement and %d moves in the window. ' % (moving / 60, r['moves'])
+               + ('' if enough else 'Fewer than five minutes of movement or 200 moves: the shape can be fitted, the gains wait for more data. '))
+    return {'verdict': verdict, 'confidence': confidence, 'proposal': proposal, 'changes': changes, 'notes': notes, 'message': message.strip(),
+            'evidence': dict(r, movingSeconds=round(moving, 1), p45=round(p45, 1), median=round(p50, 1), p90=round(p90, 1),
+                             startMm=round(start_mm, 1), endMm=round(end_mm, 1)),
+            'previous': previous, 'now': now}
+
+
+def load_log():
+    try:
+        value = json.loads((STATE / OPTIMIZE_LOG).read_text())
+        return value if isinstance(value, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def optimize(current):
+    db = db_open()
+    now = time.time()
+    log = load_log()
+    since = now - RETENTION
+    applied = [e for e in log if e.get('applied')]
+    # Judge with everything since the last applied pass, so an old habit does
+    # not outvote a week of the new curve; the first pass sees the whole week.
+    if applied:
+        since = max(since, applied[-1]['ts'])
+    return propose(current, load_sessions(db, since), load_hist(db, since), log, now)
+
+
+def optimize_applied(entry):
+    log = load_log()
+    log.append({'ts': time.time(), 'applied': True, 'changes': entry.get('changes', []), 'evidence': entry.get('evidence', {}),
+                'practiceMedianMs': entry.get('practiceMedianMs'), 'verdict': entry.get('verdict', '')})
+    atomic(STATE, OPTIMIZE_LOG, log[-50:])
+    return {'message': 'Applied and logged. The next Optimize reports whether this one helped.'}
 
 
 # ---- actions --------------------------------------------------------------
@@ -846,7 +1122,8 @@ def one_shot():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule'])
+    parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule', 'optimize', 'optimize-applied'])
+    parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
     args = parser.parse_args()
     os.umask(0o077)
@@ -858,8 +1135,17 @@ def main():
         if args.action == 'udev-rule':
             print(UDEV_RULE, end='')
             return
-        value = {'snapshot': one_shot, 'install-service': install_service, 'uninstall-service': uninstall_service,
-                 'grant-access': grant_access, 'revoke-access': revoke_access}.get(args.action, lambda: visit(args.link))()
+        if args.action in ('optimize', 'optimize-applied'):
+            try:
+                payload = json.loads(args.payload or '{}')
+            except ValueError:
+                raise RuntimeError('The optimizer needs a JSON payload.')
+            if not isinstance(payload, dict):
+                raise RuntimeError('The optimizer payload must be an object.')
+            value = optimize(payload) if args.action == 'optimize' else optimize_applied(payload)
+        else:
+            value = {'snapshot': one_shot, 'install-service': install_service, 'uninstall-service': uninstall_service,
+                     'grant-access': grant_access, 'revoke-access': revoke_access}.get(args.action, lambda: visit(args.link))()
         print(json.dumps(value))
     except Exception as e:  # noqa: BLE001 - every failure is reported as JSON for the panel
         print(json.dumps({'error': str(e)}))

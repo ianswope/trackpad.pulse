@@ -283,5 +283,182 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps(tp.zero_counters()))['touches'], 0)
 
 
+class FingerprintTests(unittest.TestCase):
+    """Overshoot corrections and re-strokes are named as sessions end, against the session before."""
+
+    def drag(self, p, tracking, x0, y0, x1, y1, t0, seconds, steps=8):
+        f = Finger(p, 0, tracking)
+        f.down(x0, y0, t0); sync(p, t0, True)
+        for i in range(1, steps + 1):
+            t = t0 + seconds * i / steps
+            f.move(int(x0 + (x1 - x0) * i / steps), int(y0 + (y1 - y0) * i / steps), t); sync(p, t)
+        f.up(t0 + seconds + 0.02); sync(p, t0 + seconds + 0.02, False)
+
+    def test_short_move_back_after_a_long_move_is_a_correction(self):
+        p = pad()
+        self.drag(p, 1, 500, 1000, 500 + 30 * RES, 1000, 100.0, 0.2)      # 30 mm right at 150 mm/s
+        self.drag(p, 2, 1500, 1000, 1500 - 2 * RES, 1000, 100.5, 0.3)     # 2 mm back, 0.28 s later
+        self.assertEqual([r['kind'] for r in p.sessions], ['move', 'move'])
+        self.assertEqual(p.sessions[1]['flag'], 'correction')
+        self.assertAlmostEqual(p.sessions[1]['ref'], p.sessions[0]['peak'], places=3)
+        self.assertEqual(p.counts['corrections'], 1)
+        self.assertEqual(p.counts['longMoves'], 1)
+        self.assertAlmostEqual(p.sessions[0]['dx'], 30.0, places=1)
+
+    def test_long_move_continued_at_once_is_a_restroke(self):
+        p = pad()
+        self.drag(p, 1, 200, 1000, 200 + 25 * RES, 1000, 100.0, 0.25)
+        self.drag(p, 2, 200, 1000, 200 + 25 * RES, 1000, 100.6, 0.25)
+        self.assertEqual(p.sessions[1]['flag'], 'restroke')
+        self.assertEqual(p.counts['restrokes'], 1)
+        self.assertEqual(p.counts['longMoves'], 2)
+
+    def test_unrelated_moves_carry_no_flag(self):
+        p = pad()
+        self.drag(p, 1, 200, 1000, 200 + 25 * RES, 1000, 100.0, 0.25)
+        self.drag(p, 2, 200, 1000, 200 - 25 * RES, 1000, 102.0, 0.25)     # 1.7 s later: a new intention
+        self.assertEqual(p.sessions[1]['flag'], '')
+        self.drag(p, 3, 200, 1000, 200 + 25 * RES, 1000, 103.0, 0.25)
+        self.drag(p, 4, 1500, 1000, 1500 + 2 * RES, 1000, 103.4, 0.3)     # short, same direction: not a correction
+        self.assertEqual(p.sessions[3]['flag'], '')
+
+    def test_scroll_reversal_and_scroll_restroke(self):
+        p = pad()
+        def scroll(tracking, y0, y1, t0):
+            a, b = Finger(p, 0, tracking), Finger(p, 1, tracking + 50)
+            a.down(1000, y0, t0); b.down(1000 + 15 * RES, y0, t0); sync(p, t0, True)
+            for i in range(1, 6):
+                t = t0 + 0.05 * i
+                a.move(1000, int(y0 + (y1 - y0) * i / 5), t); b.move(1000 + 15 * RES, int(y0 + (y1 - y0) * i / 5), t); sync(p, t)
+            a.up(t0 + 0.3); b.up(t0 + 0.3); sync(p, t0 + 0.3, False)
+        scroll(1, 500, 500 + 20 * RES, 100.0)
+        scroll(2, 1200, 1200 - 5 * RES, 100.5)
+        self.assertEqual([r['kind'] for r in p.sessions], ['scroll', 'scroll'])
+        self.assertEqual(p.sessions[1]['flag'], 'scrollCorrection')
+        scroll(3, 500, 500 + 20 * RES, 102.0)
+        scroll(4, 500, 500 + 20 * RES, 102.4)
+        self.assertEqual(p.sessions[3]['flag'], 'scrollRestroke')
+        self.assertEqual(p.counts['scrollCorrections'], 1)
+        self.assertEqual(p.counts['scrollRestrokes'], 1)
+
+
+def synthetic_sessions(n_moves=400, correction_after_fast=0.0, restrokes=0.0, slow_corrections=0.0, scrolls=0, reversals=0.0):
+    """A window of sessions with tunable fingerprint rates, speeds split around 50 mm/s."""
+    out, t = [], 1_000_000.0
+    for i in range(n_moves):
+        fast = i % 2 == 0
+        peak = 120.0 if fast else 20.0
+        out.append({'ts': t, 'kind': 'move', 'fingers': 1, 'duration': 0.3, 'dist': 25.0, 'peak': peak, 'mean': peak * 0.6, 'dx': 25.0, 'dy': 0.0, 'flag': '', 'ref': 0.0})
+        t += 1
+        if fast and (i // 2) < int(n_moves / 2 * correction_after_fast):
+            out.append({'ts': t, 'kind': 'move', 'fingers': 1, 'duration': 0.1, 'dist': 2.0, 'peak': 30.0, 'mean': 20.0, 'dx': -2.0, 'dy': 0.0, 'flag': 'correction', 'ref': peak})
+            t += 1
+        if not fast and (i // 2) < int(n_moves / 2 * slow_corrections):
+            out.append({'ts': t, 'kind': 'move', 'fingers': 1, 'duration': 0.1, 'dist': 2.0, 'peak': 15.0, 'mean': 10.0, 'dx': -2.0, 'dy': 0.0, 'flag': 'correction', 'ref': peak})
+            t += 1
+        if fast and (i // 2) < int(n_moves / 2 * restrokes):
+            out.append({'ts': t, 'kind': 'move', 'fingers': 1, 'duration': 0.3, 'dist': 25.0, 'peak': peak, 'mean': 70.0, 'dx': 25.0, 'dy': 0.0, 'flag': 'restroke', 'ref': peak})
+            t += 1
+    for i in range(scrolls):
+        out.append({'ts': t, 'kind': 'scroll', 'fingers': 2, 'duration': 0.3, 'dist': 20.0, 'peak': 80.0, 'mean': 60.0, 'dx': 0.0, 'dy': 20.0,
+                    'flag': 'scrollCorrection' if i < int(scrolls * reversals) else '', 'ref': 80.0})
+        t += 1
+    return out
+
+
+def synthetic_hist(median_mm=15.0, p90_mm=90.0, seconds=1800.0):
+    """Movement time spread so the given percentiles fall where asked."""
+    hist = [0.0] * (tp.BINS + 1)
+    m, n = int(median_mm / tp.BIN_MM_S), int(p90_mm / tp.BIN_MM_S)
+    for i in range(m):
+        hist[i] = seconds * 0.5 / m
+    for i in range(m, n):
+        hist[i] = seconds * 0.4 / max(1, n - m)
+    hist[n] = seconds * 0.1
+    return hist
+
+
+class OptimizerTests(unittest.TestCase):
+    CURRENT = {'profile': 'custom', 'curve': {'precision': 0.1875, 'start': 1.3, 'end': 2.6, 'fast': 0.6225}, 'scrollFactor': 0.33, 'scrollScale': 1.0, 'gainMaximum': 1.0}
+
+    def test_fit_places_start_and_end_at_the_percentiles(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(), synthetic_hist(15, 90))
+        keys = {c['key']: c for c in out['changes']}
+        self.assertIn('start', keys)
+        self.assertIn('end', keys)
+        self.assertAlmostEqual(out['proposal']['curve']['start'], round(tp.percentile(synthetic_hist(15, 90), 0.45) / 25.4, 2), places=2)
+        self.assertAlmostEqual(out['proposal']['curve']['end'], round(90 / 25.4, 2), places=2)
+        self.assertEqual(out['verdict'], 'fit')
+        self.assertEqual(out['confidence'], 'medium')
+        self.assertEqual(out['proposal']['curve']['fast'], self.CURRENT['curve']['fast'], 'no fingerprint, no gain change')
+
+    def test_overshoots_after_fast_moves_lower_fast_gain_by_one_nudge(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(correction_after_fast=0.4), synthetic_hist(15, 90))
+        fast = [c for c in out['changes'] if c['key'] == 'fast']
+        self.assertEqual(len(fast), 1)
+        self.assertAlmostEqual(fast[0]['to'], round(0.6225 * tp.NUDGE_DOWN, 4))
+        self.assertEqual(out['verdict'], 'nudge')
+
+    def test_restrokes_raise_fast_gain_unless_at_the_ceiling(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(restrokes=0.3), synthetic_hist(15, 90))
+        fast = [c for c in out['changes'] if c['key'] == 'fast']
+        self.assertEqual(len(fast), 1)
+        self.assertAlmostEqual(fast[0]['to'], round(0.6225 * tp.NUDGE_UP, 4))
+        capped = dict(self.CURRENT, curve=dict(self.CURRENT['curve'], fast=0.95))
+        out = tp.propose(capped, synthetic_sessions(restrokes=0.3), synthetic_hist(15, 90))
+        self.assertFalse([c for c in out['changes'] if c['key'] == 'fast'])
+        self.assertTrue(any('Device scale' in n for n in out['notes']))
+
+    def test_both_signals_cancel_and_say_so(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(correction_after_fast=0.4, restrokes=0.3), synthetic_hist(15, 90))
+        self.assertFalse([c for c in out['changes'] if c['key'] == 'fast'])
+        self.assertTrue(any('cancel' in n for n in out['notes']))
+
+    def test_slow_corrections_lower_precision_and_scroll_reversals_lower_scroll(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(slow_corrections=0.5, scrolls=60, reversals=0.5), synthetic_hist(15, 90))
+        keys = {c['key']: c for c in out['changes']}
+        self.assertAlmostEqual(keys['precision']['to'], round(0.1875 * tp.NUDGE_DOWN, 4))
+        self.assertAlmostEqual(keys['scroll']['to'], round(0.33 * tp.NUDGE_DOWN, 2))
+
+    def test_system_profile_gets_a_first_fit_from_the_preset(self):
+        current = dict(self.CURRENT, profile='adaptive', curve=None)
+        out = tp.propose(current, synthetic_sessions(), synthetic_hist(15, 90))
+        self.assertEqual(out['verdict'], 'first fit')
+        self.assertEqual(out['proposal']['profile'], 'custom')
+        self.assertLessEqual(out['proposal']['curve']['fast'], 1.0)
+        self.assertGreater(out['proposal']['curve']['end'], out['proposal']['curve']['start'])
+
+    def test_thin_data_fits_the_shape_but_withholds_the_gains(self):
+        out = tp.propose(self.CURRENT, synthetic_sessions(n_moves=40, correction_after_fast=0.9), synthetic_hist(15, 90, seconds=60))
+        self.assertEqual(out['confidence'], 'low')
+        self.assertFalse([c for c in out['changes'] if c['key'] == 'fast'])
+        self.assertIn('Fewer than five minutes', out['message'])
+
+    def test_previous_pass_is_judged_by_rates_since_it_was_applied(self):
+        sessions = synthetic_sessions(correction_after_fast=0.4)
+        log = [{'ts': sessions[len(sessions) // 2]['ts'], 'applied': True, 'changes': [{'key': 'fast'}], 'evidence': {'fastCorrectionRate': 0.4}, 'practiceMedianMs': 900}]
+        out = tp.propose(dict(self.CURRENT, practiceMedianMs=700), sessions, synthetic_hist(15, 90), log)
+        self.assertIsNotNone(out['previous'])
+        self.assertEqual(out['previous']['before']['fastCorrectionRate'], 0.4)
+        self.assertIn('fastCorrectionRate', out['previous']['after'])
+        self.assertEqual(out['previous']['practiceAfter'], 700)
+
+    def test_log_round_trip_and_sessions_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            self.assertEqual(tp.load_log(), [])
+            tp.optimize_applied({'changes': [{'key': 'start'}], 'evidence': {'correctionRate': 0.1}, 'practiceMedianMs': 800})
+            self.assertEqual(len(tp.load_log()), 1)
+            db = tp.db_open()
+            recs = [{'wall': 5.0, 'start': 0, 'end': 0.3, 'kind': 'move', 'fingers': 1, 'duration': 0.3, 'dist': 20.0, 'peak': 100.0, 'mean': 66.0, 'dx': 20.0, 'dy': 0.0, 'flag': '', 'ref': 0.0}]
+            tp.record_sessions(db, recs)
+            rows = tp.load_sessions(db, 0)
+            self.assertEqual(rows[0]['kind'], 'move')
+            self.assertEqual(rows[0]['dist'], 20.0)
+            out = tp.optimize({'profile': 'custom', 'curve': self.CURRENT['curve'], 'scrollFactor': 0.33, 'gainMaximum': 1})
+            self.assertIn('verdict', out)
+            self.assertIsNotNone(out['previous'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -494,6 +494,53 @@ Panel {
     pulseProc.command = root.bounded(130, ["python3", root.collector, action])
     pulseProc.running = true
   }
+  // ---- the optimizer ----------------------------------------------------
+  // A proposal from the recorder: what to change and why, from the shape of
+  // the finger-speed distribution and the overshoot / re-stroke rates since
+  // the last applied pass. Nothing moves until Apply.
+  property var proposal: null
+  readonly property var optimizeCurrent: ({
+    profile: root.pointerFeel.profile, curve: root.pointerFeel.curve, scrollFactor: root.scrollFactor, scrollScale: root.scrollScale,
+    gainMaximum: root.scrollScale, practiceMedianMs: curveEditor.practiceMedianMs })
+  function requestOptimize() {
+    if (pulseProc.running) return
+    root.proposal = null
+    root.chooseMode = false
+    root.active = "feel"
+    root.actionStatus = "Reading a week of touches…"
+    pulseProc.mode = "optimize"
+    pulseProc.command = root.bounded(60, ["python3", root.collector, "optimize", JSON.stringify(root.optimizeCurrent)])
+    pulseProc.running = true
+  }
+  function applyProposal() {
+    var p = root.proposal
+    if (!p || !p.proposal) return
+    var feel = { profile: p.proposal.profile === "mac" ? "mac" : "custom", curve: Curve.copy(p.proposal.curve) }
+    var curveChanged = p.changes.some(function(c) { return c.key !== "scroll" })
+    var scrollChanged = p.changes.some(function(c) { return c.key === "scroll" })
+    if (curveChanged) {
+      curveEditor.draft = Curve.copy(feel)
+      root.applyPointerFeel(feel)
+    }
+    if (scrollChanged) {
+      root.setScrollFactor(p.proposal.scrollFactor)
+      scrollDebounce.stop()
+      root.commitScrollFactor()
+    }
+    var entry = { changes: p.changes, evidence: p.evidence, verdict: p.verdict, practiceMedianMs: curveEditor.practiceMedianMs }
+    root.proposal = null
+    if (pulseProc.running) { root.actionStatus = "Applied; the log entry will be written on the next pass."; return }
+    pulseProc.mode = "applied"
+    pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-applied", JSON.stringify(entry)])
+    pulseProc.running = true
+  }
+  function fmtValue(key, v) {
+    if (v === null || v === undefined) return "—"
+    if (key === "start" || key === "end") return Pulse.speed(Pulse.curveToMm(v, root.mmPerUnitMs)) + " (" + (Pulse.num(v) / 4 * 100).toFixed(0) + "%)"
+    if (key === "scroll") return Pulse.num(v).toFixed(2) + "×"
+    if (key === "profile") return String(v)
+    return Pulse.num(v).toFixed(4) + "×"
+  }
   readonly property var links: ({ site: "https://nixfred.com", repo: "https://github.com/nixfred/trackpad.pulse", plugins: "https://omarchy.nixfred.com",
     upstream: "https://github.com/davefano/omarchy-trackpad-plus", origin: "https://github.com/awkent01/omarchy-touchpad-widget" })
   function openLink(name) {
@@ -524,10 +571,15 @@ Panel {
   }
   Process {
     id: pulseProc
+    property string mode: "status"
     stdout: StdioCollector {
       onStreamFinished: {
-        try { var r = JSON.parse(text); root.actionStatus = r.error || r.message || "Done" }
-        catch (e) { root.actionStatus = "The recorder helper did not answer." }
+        try {
+          var r = JSON.parse(String(text))
+          if (pulseProc.mode === "optimize" && !r.error) { root.proposal = r; root.actionStatus = "" }
+          else root.actionStatus = r.error || r.message || "Done"
+        } catch (e) { root.actionStatus = "The recorder helper did not answer." }
+        pulseProc.mode = "status"
         snapshotFile.reload()
       }
     }
@@ -545,6 +597,7 @@ Panel {
     function page(name: string): void { if (root.showPage(String(name))) root.open() }
     function chooser(): void { root.chooseMode = true; root.open() }
     function enable(on: bool): void { root.setTouchpadEnabled(on) }
+    function optimize(): void { root.requestOptimize(); root.open() }
   }
 
   // ---- Lifecycle ----
@@ -1397,6 +1450,85 @@ Panel {
                   tint: root.tint; heat: root.heat; ink: root.ink; surface: Color.popups.background
                 }
                 Label { width: parent.width; font.pixelSize: 10; wrapMode: Text.WordWrap; text: "Bars: seconds of finger movement per 5 mm/s. Solid line: median. Dotted: 90th percentile. Shaded: the draft curve's acceleration band. Dashed: the right edge of the graph on the left." }
+              }
+            }
+            Card {
+              width: parent.width; height: optimizeColumn.implicitHeight + 28
+              border.color: root.proposal ? Qt.alpha(root.tint, 0.55) : root.cardEdge
+              Column {
+                id: optimizeColumn
+                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
+                spacing: 8
+                Row {
+                  width: parent.width
+                  Heading { text: "OPTIMIZE FOR MY HAND"; font.pixelSize: 12; width: parent.width - 150 }
+                  Label {
+                    width: 150; horizontalAlignment: Text.AlignRight; font.pixelSize: 10
+                    text: root.proposal ? root.proposal.verdict + " · " + root.proposal.confidence + " confidence" : ""
+                    color: root.proposal && root.proposal.confidence === "high" ? root.tint : root.inkDim
+                  }
+                }
+                Label {
+                  visible: !root.proposal
+                  width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11
+                  text: "Fits Start and End to where your fingers live, then nudges the gains and the scroll speed by at most 10% a pass from your overshoots and re-strokes. Every pass is logged, and the next one says whether the last one helped. Nothing changes until you Apply."
+                }
+                Column {
+                  visible: !!root.proposal
+                  width: parent.width; spacing: 6
+                  Repeater {
+                    model: root.proposal ? root.proposal.changes : []
+                    Column {
+                      id: changeRow
+                      required property var modelData
+                      width: parent.width; spacing: 1
+                      Row {
+                        spacing: 8
+                        Heading { text: changeRow.modelData.label; font.pixelSize: 12; width: 110 }
+                        Label { text: root.fmtValue(changeRow.modelData.key, changeRow.modelData.from) + "  →  "; font.pixelSize: 12 }
+                        Heading { text: root.fmtValue(changeRow.modelData.key, changeRow.modelData.to); font.pixelSize: 12; color: root.tint }
+                      }
+                      Label { text: changeRow.modelData.reason; width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10 }
+                    }
+                  }
+                  Label {
+                    visible: !!root.proposal && root.proposal.changes.length === 0
+                    width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11; color: root.ink
+                    text: "Nothing to change: the shape already fits and neither overshoots nor re-strokes are running high."
+                  }
+                  Repeater {
+                    model: root.proposal ? root.proposal.notes : []
+                    Label { required property string modelData; text: "· " + modelData; width: optimizeColumn.width; wrapMode: Text.WordWrap; font.pixelSize: 10; color: root.ink }
+                  }
+                  Label {
+                    width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10
+                    text: {
+                      var p = root.proposal
+                      if (!p) return ""
+                      var e = p.evidence || {}
+                      return p.message + "  Overshoot corrections " + Math.round(Pulse.num(e.correctionRate) * 100) + "% of long moves (" + Math.round(Pulse.num(e.fastCorrectionRate) * 100) + "% after fast ones)  ·  re-strokes " + Math.round(Pulse.num(e.restrokeRate) * 100) + "%  ·  scroll reversals " + Math.round(Pulse.num(e.scrollReversalRate) * 100) + "% of " + Pulse.int(e.scrolls) + " scrolls."
+                    }
+                  }
+                  Label {
+                    visible: !!(root.proposal && root.proposal.previous)
+                    width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 10; color: root.ink
+                    text: {
+                      var q = root.proposal ? root.proposal.previous : null
+                      if (!q) return ""
+                      var b = q.before || {}, a = q.after || {}
+                      var s = "Since the pass applied " + Qt.formatDateTime(new Date(Pulse.num(q.ts) * 1000), "ddd d MMM h:mm AP") + ": corrections " + Math.round(Pulse.num(b.correctionRate) * 100) + "% → " + Math.round(Pulse.num(a.correctionRate) * 100) + "%, re-strokes " + Math.round(Pulse.num(b.restrokeRate) * 100) + "% → " + Math.round(Pulse.num(a.restrokeRate) * 100) + "%"
+                      if (q.practiceBefore && q.practiceAfter) s += ", target practice " + (Pulse.num(q.practiceBefore) / 1000).toFixed(2) + " s → " + (Pulse.num(q.practiceAfter) / 1000).toFixed(2) + " s"
+                      return s + "."
+                    }
+                  }
+                }
+                Row {
+                  spacing: 8
+                  Action { visible: !root.proposal; text: pulseProc.running && pulseProc.mode === "optimize" ? "Reading…" : "Optimize for my hand"; accent: root.tint; selected: true; enabled: !pulseProc.running && !root.cursorOnly && !root.stale; onClicked: root.requestOptimize() }
+                  Action { visible: !!root.proposal && root.proposal.changes.length > 0; text: "Apply this"; accent: root.tint; selected: true; enabled: !(actionProc.running || root.pendingActions.length > 0); onClicked: root.applyProposal() }
+                  Action { visible: !!root.proposal; text: root.proposal && root.proposal.changes.length > 0 ? "Dismiss" : "Close"; onClicked: root.proposal = null }
+                  Label { visible: root.cursorOnly || root.stale; anchors.verticalCenter: parent.verticalCenter; font.pixelSize: 10; text: root.stale ? "needs the recorder" : "needs pad access, not cursor-only" }
+                }
               }
             }
             Card {
