@@ -2,6 +2,10 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.7.1 — 2026-09-15
+
+- Fix: after a reboot the bar chip sat dead, no finger, no ripple, while the counts kept moving. The live file lives on tmpfs and did not exist when the shell started, and a file watch armed on a missing path never fires. The recorder now writes the live file at startup, and the panel re-arms the watch whenever the snapshot says the pad was touched after the last live frame it saw.
+- Housekeeping on gus: the old Trackpad Plus plugin directory had become a second clone of this repo (the first-night install kept pulling the fork), so two directories carried the same plugin id. Moved out of the plugins directory.
 ## 1.7.0 — 2026-09-14
 
 - **Every pad gets its own starting feel.** The Mac-inspired preset put the same gains on every pad. The recorder now measures each pad's width (the kernel's resolution, else udev's recorded size, else the size libinput itself assumes) and the widest screen, and the preset's gains scale with screen pixels per pad millimetre. The anchor is a 124 mm pad on a 1920-pixel screen, where the gains are exactly what Trackpad Plus ships; that anchor is a choice, not a measurement. A 160 mm pad on the same screen starts at 0.78×, a small pad on a wide desktop at up to 2×, clamped to 0.5–2. Fast swipes still stops at Device scale. Start and End are finger speeds and do not move. Optimize's first fit starts from the same sized gains.

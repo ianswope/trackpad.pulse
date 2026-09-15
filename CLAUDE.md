@@ -121,6 +121,14 @@ a snapshot still stale after five seconds runs `ensure-service`, which starts
 the unit unless the `recorder-stopped` marker (left by Stop the recorder) is
 there. Machines installed that way sat at RECORDER OFFLINE before 1.6.1.
 
+The live file is on tmpfs. After a reboot it does not exist until the
+recorder writes it, and a Quickshell `FileView` whose `watchChanges` was armed
+on a missing path never fires: the chip sits dead while every counter moves.
+The recorder writes the file at startup and the panel's `liveWatchDead` timer
+re-arms the view (path off, path on, reload) whenever the snapshot's
+`lastTouch` is newer than the last live frame. Probe it by writing one
+synthetic finger into `live.json` and reading `fingers` from `status`.
+
 A recorder release that adds a counter must merge over the previous release's
 `today.json` (`_load_today` does); the 1.1.0 recorder crash-looped on exactly
 that. The daemon's loop survives a bad tick now, but the journal

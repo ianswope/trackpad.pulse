@@ -1493,6 +1493,10 @@ class Recorder:
             except BlockingIOError:
                 return
             atomic(STATE, 'history.json', {str(s): history(self.db, s) for s in (3600, 86400, 604800)})
+            # The live file lives on tmpfs and is gone after a reboot. Write it
+            # before the first touch so a shell that starts alongside us finds
+            # a file to watch; a watch armed on a missing file never fires.
+            self.write_live(time.time())
             while True:
                 try:
                     self.tick()

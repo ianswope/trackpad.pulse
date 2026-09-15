@@ -671,6 +671,21 @@ Panel {
     onFileChanged: reload()
     onLoaded: { try { root.live = JSON.parse(text()) } catch (e) {} }
   }
+  // The live file lives on tmpfs and does not exist until the recorder's first
+  // write after a boot. A watch armed on a missing file never fires, and the
+  // chip sits dead while the counts keep moving. The snapshot, which does
+  // arrive, says when the pad was last touched: if that is newer than the last
+  // live frame we saw, the watch is re-armed by giving the view its path again.
+  readonly property bool liveWatchDead: !root.stale && Pulse.num(root.snap.lastTouch) > Pulse.num(root.live.ts) + 1.0
+  Timer {
+    interval: 1500; repeat: true; running: root.liveWatchDead
+    onTriggered: {
+      var p = root.runtimeDir + "/live.json"
+      liveFile.path = ""
+      liveFile.path = p
+      liveFile.reload()
+    }
+  }
   FileView {
     id: historyFile; path: root.stateDir + "/history.json"; watchChanges: true; printErrors: false
     onFileChanged: reload()
