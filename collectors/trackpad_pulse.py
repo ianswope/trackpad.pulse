@@ -56,6 +56,10 @@ AUTO_OFF_MARKER = 'auto-off'
 # a brief, short touch on a pad that sat idle; a rest is a slow, short drift
 # that began in the thumb strip at the bottom or the palm strips at the sides.
 STRAY_GUARD_MARKER = 'stray-guard'
+# Auto mode: the standing check applies its own single change when this marker
+# exists. Opt-in, never the default; the next pass keeps or undoes it the same
+# way, and the panel shows every auto change with an Undo button.
+AUTO_OPTIMIZE_MARKER = 'auto-optimize'
 # Left by Stop the recorder, so the panel's start-on-load leaves a stopped
 # recorder stopped. Start the recorder removes it.
 RECORDER_STOPPED_MARKER = 'recorder-stopped'
@@ -972,7 +976,8 @@ def report(db, today, log, now):
             'strays': stray_summary(db, today, now),
             'optimize': [{'ts': e['ts'], 'changes': [c.get('label', c.get('key')) for c in e.get('changes', [])], 'before': (e.get('evidence') or {}).get('correctionRate'),
                           'verdict': e.get('verdict', ''), 'judgement': e.get('judgement') or ('undo' if e.get('undo') else 'watching'),
-                          'reason': e.get('judgeReason', ''), 'undo': bool(e.get('undo'))} for e in (log or []) if e.get('applied')][-5:]}
+                          'reason': e.get('judgeReason', ''), 'undo': bool(e.get('undo')), 'auto': bool(e.get('auto')), 'byUser': bool(e.get('byUser'))}
+                         for e in (log or []) if e.get('applied')][-5:]}
 
 
 WINDOW_KEYS = ('distance', 'touches', 'taps', 'clicks', 'active')
@@ -1480,6 +1485,7 @@ class Recorder:
                 'heatW': HEAT_W, 'heatH': HEAT_H, 'mouse': mouse_live,
                 'autoOff': {'enabled': self.auto_off_wanted, 'offNow': self.pad_off_by_us, 'today': self.today.get('autoOff', 0)},
                 'strayGuard': dict(stray_summary(self.db, self.today, now), enabled=self.stray_wanted),
+                'autoOptimize': {'enabled': (STATE / AUTO_OPTIMIZE_MARKER).exists()},
                 'hand': hand_verdict(self.today.get('heat') or [], self.today.get('palmX', 0.0), self.today.get('palmN', 0)),
                 'udevRulePath': str(UDEV_RULE_PATH), 'pads': pads, 'today': self.today, 'week': week,
                 'screenPx': round(self.screen_px), 'weekByDevice': self.week_by_device,
@@ -1779,20 +1785,7 @@ def propose(current, sessions, hist, log=None, now=None):
         queued = [q for cand in candidates for q in as_queued(cand)]
     elif previous and previous['judgement'] == 'undo':
         verdict = 'undo'
-        head = previous['changes']
-        if head and head[0]['key'] == 'profile':
-            back = head[0]['from'] or 'adaptive'
-            proposal['profile'] = back
-            changes = [{'key': 'profile', 'label': 'Profile', 'from': 'custom', 'to': back, 'direction': 'undo', 'undo': True, 'reverts': previous['ts'],
-                        'reason': previous['reason'] + ' Undo goes back to the %s profile.' % back}]
-        else:
-            for c in head:
-                if c['key'] == 'scroll':
-                    proposal['scrollFactor'] = c['from']
-                else:
-                    proposal['curve'][c['key']] = c['from']
-                changes.append({'key': c['key'], 'label': c.get('label', c['key']), 'from': c['to'], 'to': c['from'], 'direction': 'undo', 'undo': True, 'reverts': previous['ts'],
-                                'reason': previous['reason'] + ' Undo puts %s back to %s.' % (c.get('label', c['key']), fmt_value(c['from']))})
+        changes = revert_changes(previous['changes'], previous['reason'], previous['ts'], proposal)
         queued = [q for cand in candidates for q in as_queued(cand)]
     elif candidates:
         first = candidates[0]
@@ -1821,6 +1814,69 @@ def propose(current, sessions, hist, log=None, now=None):
             'evidence': dict(r, movingSeconds=round(moving, 1), p45=round(p45, 1), median=round(p50, 1), p90=round(p90, 1),
                              startMm=round(start_mm, 1), endMm=round(end_mm, 1)),
             'previous': previous, 'now': now, 'device': current.get('device') or ''}
+
+
+def revert_changes(head, reason, ts, proposal):
+    """The change records that put an applied pass back, and the proposal they lead to. Pure apart from mutating `proposal`."""
+    if head and head[0]['key'] == 'profile':
+        back = head[0].get('from') or 'adaptive'
+        proposal['profile'] = back
+        return [{'key': 'profile', 'label': 'Profile', 'from': 'custom', 'to': back, 'direction': 'undo', 'undo': True, 'reverts': ts,
+                 'reason': reason + ' Undo goes back to the %s profile.' % back}]
+    out = []
+    for c in head:
+        if c['key'] == 'scroll':
+            proposal['scrollFactor'] = c['from']
+        else:
+            proposal.setdefault('curve', {})[c['key']] = c['from']
+        out.append({'key': c['key'], 'label': c.get('label', c['key']), 'from': c.get('to'), 'to': c.get('from'), 'direction': 'undo', 'undo': True, 'reverts': ts,
+                    'reason': reason + ' Undo puts %s back to %s.' % (c.get('label', c['key']), fmt_value(c.get('from')))})
+    return out
+
+
+def backend_calls(changes, proposal, scroll_scale):
+    """What Trackpad Plus's `set` has to be told to make a proposal real: [(option, value)]. Pure.
+
+    A curve change is one pointer_feel write of the whole profile and curve,
+    which is the journalled path, so Restore previous keeps working. A scroll
+    change is the slider value times the device scale, as the panel sends it.
+    """
+    calls = []
+    if any(c['key'] != 'scroll' for c in changes):
+        calls.append(('pointer_feel', {'profile': proposal.get('profile') or 'custom', 'curve': dict(proposal['curve'])}))
+    if any(c['key'] == 'scroll' for c in changes):
+        calls.append(('scroll_factor', round(float(proposal['scrollFactor']) * float(scroll_scale or 1), 6)))
+    return calls
+
+
+def apply_backend(device, calls):
+    """Run each call through trackpads.py set. Stops at the first refusal."""
+    for option, value in calls:
+        result = subprocess.run([sys.executable, str(PLUGIN_ROOT / 'trackpads.py'), 'set', str(device), option, json.dumps(value)],
+                                capture_output=True, text=True, timeout=20, check=False)
+        if result.returncode != 0:
+            print('Trackpad Pulse: auto optimize: set %s refused: %s' % (option, (result.stdout or result.stderr or '').strip()[:200]), flush=True)
+            return False
+    return True
+
+
+def should_auto_apply(p, enabled):
+    """Auto mode applies one medium-or-high-confidence change per pass; a first fit stays yours. Pure."""
+    return bool(enabled and p.get('changes') and p.get('confidence') in ('medium', 'high') and p.get('verdict') in ('fit', 'nudge', 'undo'))
+
+
+def auto_summary(row):
+    """One line for the banner: what the last auto pass changed, and why."""
+    changes = row.get('changes') or []
+    summary = ('Undid ' if row.get('undo') else '') + ' · '.join('%s %s → %s' % (c.get('label', c['key']), fmt_value(c.get('from')), fmt_value(c.get('to'))) for c in changes)
+    reason = ' '.join((changes[0].get('reason') or '').split()[:40]) if changes else ''
+    return {'ts': row['ts'], 'summary': summary, 'reason': reason, 'device': row.get('device', ''),
+            'signature': hint_signature(changes) + '-' + str(int(row['ts']))}
+
+
+def notify(title, body):
+    if shutil.which('notify-send'):
+        subprocess.run(['notify-send', '-a', 'Trackpad Pulse', '-i', 'input-touchpad', title, body], capture_output=True, timeout=5, check=False)
 
 
 def load_log():
@@ -1871,7 +1927,7 @@ def optimize_applied(entry):
     head = changes[0] if changes else {}
     row = {'ts': time.time(), 'applied': True, 'changes': changes, 'evidence': entry.get('evidence', {}),
            'practiceMedianMs': entry.get('practiceMedianMs'), 'verdict': entry.get('verdict', ''), 'watch': head.get('watch'),
-           'device': str(entry.get('device') or '')}
+           'device': str(entry.get('device') or ''), 'auto': bool(entry.get('auto')), 'byUser': bool(entry.get('byUser'))}
     if head.get('undo'):
         original = next((e for e in log if e.get('applied') and e.get('ts') == head.get('reverts')), None)
         if original:
@@ -1898,6 +1954,25 @@ def optimize_keep(entry):
     applied[-1]['judgeReason'] = (applied[-1].get('judgeReason') or '') + ' Kept by you.'
     atomic(STATE, OPTIMIZE_LOG, log[-50:])
     return {'message': 'Kept. The next pass moves on to the next change.'}
+
+
+def optimize_undo_last(payload):
+    """Put back the last applied pass on a pad, now, through the same journalled path, and log it as an undo."""
+    log = load_log()
+    device = str(payload.get('device') or '')
+    rows = [e for e in device_log(log, device) if e.get('applied')]
+    last = rows[-1] if rows else None
+    if not last or last.get('undo') or last.get('judgement') == 'undone':
+        return {'message': 'Nothing to undo: the last pass is already an undo.'}
+    current = current_settings(last.get('device') or device or None)
+    proposal = {'curve': dict(current.get('curve') or {}), 'scrollFactor': current.get('scrollFactor', 0.4), 'profile': current.get('profile', 'custom')}
+    changes = revert_changes(last.get('changes') or [], 'Undone by you.', last['ts'], proposal)
+    if not changes:
+        return {'message': 'Nothing to undo.'}
+    if not apply_backend(current['device'], backend_calls(changes, proposal, current.get('scrollScale'))):
+        raise RuntimeError('Trackpad Plus refused the change; nothing was written.')
+    optimize_applied({'changes': changes, 'evidence': {}, 'verdict': 'undo', 'device': current['device'], 'byUser': True})
+    return {'message': 'Put back: ' + auto_summary({'ts': time.time(), 'changes': changes, 'undo': True})['summary'] + '. The same change waits until as many moves ask for it again.'}
 
 
 # ---- the standing check: does the best curve differ from the one in use? ------
@@ -1944,10 +2019,24 @@ def write_hint(db, now):
     since = max(now - RETENTION, applied[-1]['ts'] if applied else 0)
     p = propose(current, load_sessions(db, since, device), load_hist(db, since, device), mine, now)
     settle(log, p)
+    enabled = (STATE / AUTO_OPTIMIZE_MARKER).exists()
+    if should_auto_apply(p, enabled):
+        # Auto mode. One change, the same journalled path Apply uses, logged
+        # like a pressed Apply so the next pass judges it the same way. The
+        # hint then carries nothing pending and the note of what was done.
+        if apply_backend(device, backend_calls(p['changes'], p['proposal'], current.get('scrollScale'))):
+            optimize_applied({'changes': p['changes'], 'evidence': p['evidence'], 'verdict': p['verdict'], 'device': device, 'auto': True})
+            log = load_log()
+            note = auto_summary([e for e in device_log(log, device) if e.get('applied')][-1])
+            print('Trackpad Pulse: auto optimize applied ' + note['summary'], flush=True)
+            notify('Trackpad Pulse tuned itself', note['summary'] + '. ' + note['reason'] + ' Undo is on the Overview.')
+            p = dict(p, changes=[], verdict='applied')
+    auto_rows = [e for e in device_log(log, device) if e.get('applied') and e.get('auto')]
     summary = ('Undo ' if p['verdict'] == 'undo' else '') + ' · '.join('%s %s → %s' % (c['label'], fmt_value(c['from']), fmt_value(c['to'])) for c in p['changes'])
     atomic(STATE, 'hint.json', {'ts': now, 'device': current.get('device'), 'verdict': p['verdict'], 'confidence': p['confidence'],
                                 'changes': p['changes'], 'signature': hint_signature(p['changes']), 'summary': summary,
-                                'movingSeconds': p['evidence'].get('movingSeconds', 0)})
+                                'movingSeconds': p['evidence'].get('movingSeconds', 0),
+                                'autoEnabled': enabled, 'auto': auto_summary(auto_rows[-1]) if auto_rows else None})
 
 
 # ---- themes ------------------------------------------------------------------
@@ -2390,7 +2479,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['daemon', 'snapshot', 'install-service', 'uninstall-service', 'ensure-service', 'grant-access', 'revoke-access', 'visit', 'udev-rule',
                                            'optimize', 'optimize-applied', 'optimize-keep', 'hint', 'gestures-catalogue', 'gestures-apply', 'gestures-remove',
-                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'stray-guard-on', 'stray-guard-off', 'open-fullscreen'])
+                                           'theme-next', 'theme-prev', 'theme-random', 'report', 'auto-off-on', 'auto-off-off', 'stray-guard-on', 'stray-guard-off',
+                                           'auto-optimize-on', 'auto-optimize-off', 'optimize-undo-last', 'open-fullscreen'])
     parser.add_argument('payload', nargs='?', default='{}', help='JSON for optimize / optimize-applied')
     parser.add_argument('--link', choices=sorted(LINKS))
     args = parser.parse_args()
@@ -2403,14 +2493,15 @@ def main():
         if args.action == 'udev-rule':
             print(UDEV_RULE, end='')
             return
-        if args.action in ('optimize', 'optimize-applied', 'optimize-keep', 'gestures-apply'):
+        if args.action in ('optimize', 'optimize-applied', 'optimize-keep', 'optimize-undo-last', 'gestures-apply'):
             try:
                 payload = json.loads(args.payload or '{}')
             except ValueError:
                 raise RuntimeError('This action needs a JSON payload.')
             if not isinstance(payload, dict):
                 raise RuntimeError('The payload must be an object.')
-            value = {'optimize': optimize, 'optimize-applied': optimize_applied, 'optimize-keep': optimize_keep, 'gestures-apply': gestures_apply}[args.action](payload)
+            value = {'optimize': optimize, 'optimize-applied': optimize_applied, 'optimize-keep': optimize_keep, 'optimize-undo-last': optimize_undo_last,
+                     'gestures-apply': gestures_apply}[args.action](payload)
         elif args.action == 'hint':
             write_hint(db_open(), time.time())
             value = json.loads((STATE / 'hint.json').read_text())
@@ -2427,6 +2518,14 @@ def main():
             except (OSError, ValueError):
                 pass
             value = report(db_open(), today, load_log(), time.time())
+        elif args.action in ('auto-optimize-on', 'auto-optimize-off'):
+            marker = STATE / AUTO_OPTIMIZE_MARKER
+            if args.action == 'auto-optimize-on':
+                marker.touch()
+                value = {'message': 'Auto is on: every ten minutes one medium-or-high-confidence change is applied on its own, and the next pass keeps it or undoes it. First fits stay yours.'}
+            else:
+                marker.unlink(missing_ok=True)
+                value = {'message': 'Auto is off. Proposals light the button and wait for Apply.'}
         elif args.action in ('stray-guard-on', 'stray-guard-off'):
             marker = STATE / STRAY_GUARD_MARKER
             if args.action == 'stray-guard-on':

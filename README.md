@@ -92,7 +92,9 @@ A touch you did not mean still moves the cursor. libinput already drops what the
 
 **Put back** is the opt-in neutralizer. 0.3 s after a stray touch lifts, if no finger is back on the pad and no mouse has moved the cursor since, the recorder warps the cursor to where it was before the finger landed, through Hyprland's own cursor dispatcher. The motion already happened, so this is a put-back, not a block; what it removes is the cursor sitting somewhere you did not put it. A real move within a second of a put-back is counted as a regret, the card shows regrets against put-backs, and it tells you when the guard is fighting you. Never on by default.
 
-**It keeps watching.** Every ten minutes the recorder re-runs the same optimizer against the settings you actually have. When a proposal with real changes and at least medium confidence turns up that you have not seen, the Optimize button and the Pointer feel tab light up and the Overview carries a one-line banner with **Review** and **Later**. Nothing is applied for you.
+**It keeps watching.** Every ten minutes the recorder re-runs the same optimizer against the settings you actually have. When a proposal with real changes and at least medium confidence turns up that you have not seen, the Optimize button and the Pointer feel tab light up and the Overview carries a one-line banner with **Review** and **Later**. Nothing is applied for you unless you ask for that:
+
+**Auto mode**, the switch on the Optimize card, off by default. On, the standing check applies its own single change every ten minutes when the proposal has medium or high confidence, through the same journalled path Apply uses, logged exactly like a pressed Apply so the next pass keeps it or undoes it the same way. A first fit from System or Flat is never applied on its own. Each auto change lands on the Overview with what changed and why, **Undo** and **OK**, plus a desktop notification; Undo puts it back through the same path and holds that change until as many moves ask for it again.
 
 ---
 

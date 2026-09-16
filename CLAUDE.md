@@ -72,9 +72,15 @@ what lets the finger-speed histogram sit under the curve.
    verdict is written into the log by `settle()`, never recomputed. An undo is
    a proposal like any other, carrying the logged reason. Do not add a second
    change to a pass, and do not judge silently.
-4. **Never auto-apply a setting.** Optimize proposes; the user presses Apply,
-   and Apply goes through Trackpad Plus's journalled `applyPointerFeel`, so
-   Restore previous keeps working. Gestures apply on selection because that is
+4. **Never auto-apply a setting unless Auto mode is on.** Optimize proposes;
+   the user presses Apply, and Apply goes through Trackpad Plus's journalled
+   `applyPointerFeel`, so Restore previous keeps working. Auto mode (the
+   `auto-optimize` marker, opt-in, off by default, Fred 2026-09-15) lets
+   `write_hint` apply one medium-or-high-confidence change through the same
+   `trackpads.py set` path (`backend_calls` → `apply_backend`), logged with
+   `auto: true`; `should_auto_apply` never passes a first fit. Every auto
+   change is announced (Overview banner with Undo, notify-send). Do not widen
+   what Auto may touch without Fred. Gestures apply on selection because that is
    what the user chose, but suggested defaults are shown first and applied only
    on request.
 5. **Access model.** Omarchy strips users from the `input` group on purpose.

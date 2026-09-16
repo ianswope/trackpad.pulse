@@ -710,6 +710,78 @@ class OptimizerTests(unittest.TestCase):
             self.assertEqual(out['previous']['judgement'], 'kept by you')
 
 
+class AutoOptimizeTests(unittest.TestCase):
+    CURVE = {'precision': 0.1875, 'start': 0.59, 'end': 3.54, 'fast': 0.6225}
+
+    def proposal(self, **kw):
+        base = {'verdict': 'nudge', 'confidence': 'medium', 'changes': [{'key': 'fast', 'label': 'Fast swipes', 'from': 0.6225, 'to': 0.5727, 'direction': 'down'}],
+                'proposal': {'profile': 'custom', 'curve': dict(self.CURVE, fast=0.5727), 'scrollFactor': 0.33}, 'evidence': {'moves': 400}}
+        base.update(kw)
+        return base
+
+    def test_auto_applies_one_confident_change_and_never_a_first_fit(self):
+        self.assertTrue(tp.should_auto_apply(self.proposal(), True))
+        self.assertTrue(tp.should_auto_apply(self.proposal(verdict='undo', confidence='high'), True))
+        self.assertFalse(tp.should_auto_apply(self.proposal(), False), 'off by default')
+        self.assertFalse(tp.should_auto_apply(self.proposal(confidence='low'), True))
+        self.assertFalse(tp.should_auto_apply(self.proposal(verdict='first fit'), True), 'a profile switch stays yours')
+        self.assertFalse(tp.should_auto_apply(self.proposal(verdict='watching', changes=[]), True))
+        self.assertFalse(tp.should_auto_apply(self.proposal(changes=[]), True))
+
+    def test_backend_calls_write_the_whole_curve_and_the_scaled_scroll(self):
+        p = self.proposal()
+        calls = tp.backend_calls(p['changes'], p['proposal'], 1.0)
+        self.assertEqual(calls, [('pointer_feel', {'profile': 'custom', 'curve': dict(self.CURVE, fast=0.5727)})])
+        scroll = self.proposal(changes=[{'key': 'scroll', 'label': 'Scroll speed', 'from': 0.33, 'to': 0.3, 'direction': 'down'}],
+                               proposal={'profile': 'custom', 'curve': dict(self.CURVE), 'scrollFactor': 0.3})
+        self.assertEqual(tp.backend_calls(scroll['changes'], scroll['proposal'], 2.0), [('scroll_factor', 0.6)])
+        both = self.proposal(changes=p['changes'] + scroll['changes'], proposal=dict(p['proposal'], scrollFactor=0.3))
+        self.assertEqual([c[0] for c in tp.backend_calls(both['changes'], both['proposal'], 1.0)], ['pointer_feel', 'scroll_factor'])
+
+    def test_revert_changes_mirrors_the_applied_pass(self):
+        proposal = {'profile': 'custom', 'curve': dict(self.CURVE, fast=0.5727), 'scrollFactor': 0.33}
+        out = tp.revert_changes(self.proposal()['changes'], 'It did not help.', 123.0, proposal)
+        self.assertEqual((out[0]['key'], out[0]['from'], out[0]['to'], out[0]['undo'], out[0]['reverts']), ('fast', 0.5727, 0.6225, True, 123.0))
+        self.assertEqual(proposal['curve']['fast'], 0.6225)
+        self.assertIn('puts Fast swipes back to 0.6225', out[0]['reason'])
+        proposal = {'profile': 'custom', 'curve': dict(self.CURVE), 'scrollFactor': 0.33}
+        out = tp.revert_changes([{'key': 'profile', 'from': 'adaptive', 'to': 'custom'}, {'key': 'start', 'from': None, 'to': 0.6}], 'Worse.', 5.0, proposal)
+        self.assertEqual((out[0]['key'], out[0]['to']), ('profile', 'adaptive'))
+        self.assertEqual(proposal['profile'], 'adaptive')
+
+    def test_auto_summary_names_what_happened(self):
+        note = tp.auto_summary({'ts': 1000.0, 'changes': self.proposal()['changes'] and [dict(self.proposal()['changes'][0], reason='42% of fast moves overshot.')]})
+        self.assertEqual(note['summary'], 'Fast swipes 0.6225 → 0.5727')
+        self.assertEqual(note['reason'], '42% of fast moves overshot.')
+        self.assertTrue(note['signature'].endswith('-1000'))
+        self.assertTrue(tp.auto_summary({'ts': 1.0, 'undo': True, 'changes': [{'key': 'end', 'label': 'End', 'from': 1.97, 'to': 2.56}]})['summary'].startswith('Undid End'))
+
+    def test_the_log_remembers_who_applied_and_undo_last_puts_it_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            p = self.proposal()
+            tp.optimize_applied({'changes': p['changes'], 'evidence': p['evidence'], 'verdict': p['verdict'], 'device': 'pad-a', 'auto': True})
+            log = tp.load_log()
+            self.assertTrue(log[0]['auto'])
+            self.assertFalse(log[0]['byUser'])
+            calls = []
+            real_apply, real_current = tp.apply_backend, tp.current_settings
+            tp.apply_backend = lambda device, c: calls.append((device, c)) or True
+            tp.current_settings = lambda device=None: {'device': 'pad-a', 'profile': 'custom', 'curve': dict(self.CURVE, fast=0.5727), 'scrollFactor': 0.33, 'scrollScale': 1.0}
+            try:
+                msg = tp.optimize_undo_last({'device': 'pad-a'})
+            finally:
+                tp.apply_backend, tp.current_settings = real_apply, real_current
+            self.assertIn('Put back: Undid Fast swipes 0.5727 → 0.6225', msg['message'])
+            self.assertEqual(calls, [('pad-a', [('pointer_feel', {'profile': 'custom', 'curve': dict(self.CURVE)})])])
+            log = tp.load_log()
+            self.assertEqual(log[0]['judgement'], 'undone')
+            self.assertTrue(log[1]['undo'])
+            self.assertTrue(log[1]['byUser'])
+            self.assertEqual(log[1]['hold'], {'key': 'fast', 'direction': 'down', 'moves': 400})
+            self.assertIn('already an undo', tp.optimize_undo_last({'device': 'pad-a'})['message'])
+
+
 class StrayTouchTests(unittest.TestCase):
     def rec(self, **kw):
         base = {'kind': 'move', 'fingers': 1, 'duration': 0.15, 'dist': 2.5, 'mean': 16.0, 'cursor': 6.0, 'gap': 5.0, 'x0': 0.5, 'y0': 0.5, 'clicked': False}

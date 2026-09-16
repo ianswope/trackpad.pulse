@@ -508,6 +508,25 @@ Panel {
   readonly property bool hintActive: !!(root.hint && root.hint.changes && root.hint.changes.length > 0 && root.hint.confidence !== "low"
     && String(root.setting("hintSeen", "")) !== String(root.hint.signature) && !root.stale && !root.noAccess)
   function hintSeen() { root.setSetting("hintSeen", root.hint && root.hint.signature ? String(root.hint.signature) : "") }
+  // Auto mode: the recorder applied a change on its own. The note stays on the
+  // Overview until you press OK or Undo, whatever later passes say.
+  property var autoLocal: null
+  readonly property bool autoOptimizeOn: root.autoLocal === null ? !!((root.snap.autoOptimize || {}).enabled) : !!root.autoLocal
+  function setAutoOptimize(on) {
+    root.autoLocal = on
+    root.runPulse(on ? "auto-optimize-on" : "auto-optimize-off")
+  }
+  readonly property var autoNote: root.hint && root.hint.auto ? root.hint.auto : null
+  readonly property bool autoActive: !!(root.autoNote && String(root.setting("autoSeen", "")) !== String(root.autoNote.signature) && !root.stale)
+  function autoSeen() { root.setSetting("autoSeen", root.autoNote ? String(root.autoNote.signature) : "") }
+  function undoLastAuto() {
+    if (pulseProc.running) return
+    root.actionStatus = "Putting it back…"
+    pulseProc.mode = "undo"
+    pulseProc.command = root.bounded(30, ["python3", root.collector, "optimize-undo-last", JSON.stringify({ device: root.autoNote ? root.autoNote.device : root.selectedDevice })])
+    pulseProc.running = true
+    root.autoSeen()
+  }
   property real pulseOpacity: 1
   SequentialAnimation on pulseOpacity {
     running: root.hintActive && root.opened
@@ -519,7 +538,14 @@ Panel {
   FileView {
     id: hintFile; path: root.stateDir + "/hint.json"; watchChanges: true; printErrors: false
     onFileChanged: reload()
-    onLoaded: { try { root.hint = JSON.parse(text()) } catch (e) {} }
+    onLoaded: {
+      try {
+        var next = JSON.parse(text())
+        var was = root.hint && root.hint.auto ? root.hint.auto.signature : ""
+        root.hint = next
+        if (next.auto && next.auto.signature !== was) root.refresh()
+      } catch (e) {}
+    }
   }
 
   // ---- gestures ----------------------------------------------------------
@@ -576,6 +602,7 @@ Panel {
   onSnapChanged: {
     if (root.autoOffLocal !== null && !!((root.snap.autoOff || {}).enabled) === !!root.autoOffLocal) root.autoOffLocal = null
     if (root.strayLocal !== null && !!((root.snap.strayGuard || {}).enabled) === !!root.strayLocal) root.strayLocal = null
+    if (root.autoLocal !== null && !!((root.snap.autoOptimize || {}).enabled) === !!root.autoLocal) root.autoLocal = null
   }
   function loadReport() { if (!pulseProc.running) root.runPulse("report", [], "report") }
   function setAutoOff(on) {
@@ -715,6 +742,7 @@ Panel {
           else if (pulseProc.mode === "catalogue" && !r.error) { root.catalogue = r.actions || []; root.catalogueMeta = r; root.actionStatus = "" }
           else if (pulseProc.mode === "report" && !r.error) { root.reportData = r; root.actionStatus = "" }
           else if (pulseProc.mode === "keep" && !r.error) { root.actionStatus = r.message || "Kept."; reoptimize.start() }
+          else if (pulseProc.mode === "undo") { root.actionStatus = r.error || r.message || "Put back."; root.refresh() }
           else if (pulseProc.mode === "gestures" && !r.error) { if (r.gestures) root.setSetting("gestures", r.gestures); root.actionStatus = r.message || "Gestures applied." }
           else if (pulseProc.mode === "ensure") { if (r.error) root.actionStatus = r.error }
           else root.actionStatus = r.error || r.message || "Done"
@@ -837,6 +865,7 @@ Panel {
         if (root.spans.all) lines.push("Travelled " + Pulse.distance((root.spans.week || {}).distance) + " this week · " + Pulse.distance(root.spans.all.distance) + " all time")
       }
       if (root.hintActive) lines.push("Optimize has a new proposal: " + root.hint.summary)
+      if (root.autoActive) lines.push("Auto optimize applied: " + root.autoNote.summary)
       lines.push("Left-click: dashboard · Right-click: on/off")
       return lines.join("\n")
     }
@@ -1210,6 +1239,26 @@ Panel {
                 enabled: !pulseProc.running
                 onClicked: root.runPulse(root.stale ? "install-service" : "grant-access")
               }
+            }
+          }
+
+          // Auto mode applied a change on its own: say what and why, offer Undo.
+          Rectangle {
+            width: parent.width
+            visible: root.autoActive
+            height: visible ? 64 : 0
+            radius: 12
+            color: Util.alpha(root.tint, 0.10)
+            border.color: Qt.alpha(root.tint, 0.55)
+            Row {
+              anchors.fill: parent; anchors.margins: 12; spacing: 14
+              Column {
+                width: parent.width - 230; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                Heading { font.pixelSize: 12; text: "AUTO OPTIMIZE APPLIED  ·  " + String(root.autoNote ? root.autoNote.summary : "").toUpperCase() }
+                Label { width: parent.width; elide: Text.ElideRight; font.pixelSize: 10; text: (root.autoNote ? String(root.autoNote.reason || "") : "") + "  ·  " + Pulse.ago(root.autoNote ? root.autoNote.ts : 0, root.now) }
+              }
+              Action { anchors.verticalCenter: parent.verticalCenter; text: "Undo"; accent: root.tint; selected: true; enabled: !pulseProc.running; onClicked: root.undoLastAuto() }
+              Action { anchors.verticalCenter: parent.verticalCenter; text: "OK"; onClicked: root.autoSeen() }
             }
           }
 
@@ -1757,6 +1806,13 @@ Panel {
                   Action { visible: !!root.proposal; text: root.proposal && root.proposal.changes.length > 0 ? "Dismiss" : "Close"; onClicked: { root.proposal = null; root.hintSeen() } }
                   Label { visible: root.cursorOnly || root.stale; anchors.verticalCenter: parent.verticalCenter; font.pixelSize: 10; text: root.stale ? "needs the recorder" : "needs pad access, not cursor-only" }
                 }
+                Row {
+                  spacing: 8
+                  Label { text: "Auto"; anchors.verticalCenter: parent.verticalCenter; color: root.ink }
+                  Action { text: "On"; implicitWidth: 52; implicitHeight: 26; selected: root.autoOptimizeOn; accent: root.tint; enabled: !pulseProc.running && !root.stale; onClicked: root.setAutoOptimize(true) }
+                  Action { text: "Off"; implicitWidth: 52; implicitHeight: 26; selected: !root.autoOptimizeOn; accent: root.tint; enabled: !pulseProc.running && !root.stale; onClicked: root.setAutoOptimize(false) }
+                  Label { anchors.verticalCenter: parent.verticalCenter; width: optimizeColumn.width - 200; wrapMode: Text.WordWrap; font.pixelSize: 10; text: root.autoOptimizeOn ? "Every ten minutes one medium-or-high-confidence change is applied on its own and the next pass keeps or undoes it. Each one lands on the Overview with Undo. First fits stay yours." : "Off: proposals light the button and wait for Apply." }
+                }
               }
             }
             Card {
@@ -2023,7 +2079,7 @@ Panel {
                   required property var modelData
                   width: optColumn2.width; font.pixelSize: 11; color: root.ink
                   elide: Text.ElideRight
-                  text: Qt.formatDateTime(new Date(Pulse.num(modelData.ts) * 1000), "ddd d MMM h:mm AP") + "  ·  " + (modelData.undo ? "undid " : "changed ") + ((modelData.changes || []).join(", ") || "nothing") + "  ·  " + (modelData.judgement === "watching" ? "being judged" : modelData.judgement === "undo" ? "undo proposed" : String(modelData.judgement || "")) + (modelData.reason ? "  ·  " + String(modelData.reason) : "")
+                  text: Qt.formatDateTime(new Date(Pulse.num(modelData.ts) * 1000), "ddd d MMM h:mm AP") + "  ·  " + (modelData.auto ? "auto " : modelData.byUser ? "you " : "") + (modelData.undo ? "undid " : "changed ") + ((modelData.changes || []).join(", ") || "nothing") + "  ·  " + (modelData.judgement === "watching" ? "being judged" : modelData.judgement === "undo" ? "undo proposed" : String(modelData.judgement || "")) + (modelData.reason ? "  ·  " + String(modelData.reason) : "")
                 }
               }
               Label { visible: (reportPage.rp.optimize || []).length === 0; width: parent.width; font.pixelSize: 11; text: "No Optimize pass applied yet. Pointer feel has the button." }

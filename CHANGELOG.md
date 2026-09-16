@@ -2,6 +2,12 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.8.0 — 2026-09-15
+
+- **Auto mode**, opt-in, off by default. With the switch on the Optimize card set to On, the standing check applies its own single change every ten minutes when the proposal has medium or high confidence: the bigger miss of Start or End, one gain nudge, a scroll nudge, or the undo of a pass that did not help. It goes through Trackpad Plus's journalled `pointer_feel` and `scroll_factor` writes, so Restore previous still works, and it is logged exactly like a pressed Apply, so the next pass keeps it or undoes it the same way. A first fit from System or Flat is never applied on its own. Every auto change lands on the Overview as a banner with what changed and why, **Undo** and **OK**, and a desktop notification. Undo puts it back through the same path and holds that change until as many moves ask for it again.
+- Report: history rows say who applied each pass: you, auto, or an undo by you.
+- Recorder: `auto-optimize-on`, `auto-optimize-off`, `optimize-undo-last` actions; `auto` and `byUser` on log rows; `autoEnabled` and `auto` in `hint.json`; `autoOptimize` in the snapshot.
+
 ## 1.7.1 — 2026-09-15
 
 - Fix: after a reboot the bar chip sat dead, no finger, no ripple, while the counts kept moving. The live file lives on tmpfs and did not exist when the shell started, and a file watch armed on a missing path never fires. The recorder now writes the live file at startup, and the panel re-arms the watch whenever the snapshot says the pad was touched after the last live frame it saw.
