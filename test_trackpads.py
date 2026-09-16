@@ -1,5 +1,7 @@
 import copy
 import importlib.util
+import io
+from itertools import product
 import json
 import os
 from pathlib import Path
@@ -26,6 +28,219 @@ class TrackpadTests(unittest.TestCase):
         for g in self.groups.values():
             g['settings']={'enabled':True,'sensitivity':0.3 if g['id']=='dell' else 0.1,'scroll_factor':0.2,'natural_scroll':False,'tap_to_click':True,'clickfinger_behavior':True,'disable_while_typing':True}
         self.state={'version':1,'devices':self.groups}
+
+    def legacy_apple_state(self, name, with_apple=False):
+        state = m.migrate(self.state)
+        raw = copy.deepcopy(state['devices']['apple'])
+        raw.update(id=name, label=name, names=[name], configured=True)
+        raw['previous_pointer_feel'] = {'profile': 'flat', 'curve': dict(m.DEFAULT_CURVE)}
+        raw['settings']['scroll_factor'] = 0.34
+        if not with_apple:
+            del state['devices']['apple']
+        else:
+            # This fixture's Apple group already lists every built-in interface;
+            # the raw legacy group owns this one, and a name belongs to one group.
+            state['devices']['apple']['names'] = [n for n in state['devices']['apple']['names'] if n != name]
+        state['devices'][name] = raw
+        return state
+
+    def run_main(self, names, *args):
+        def compositor(*command):
+            if command == ('devices', '-j'):
+                return json.dumps({'mice': [{'name': n} for n in names]})
+            return 'ok'
+        with patch.object(m, 'hypr', side_effect=compositor) as run, \
+                patch.object(m.sys, 'argv', ['trackpads.py', *args]), \
+                patch('sys.stdout', new_callable=io.StringIO) as output:
+            m.main()
+        return json.loads(output.getvalue()), run
+
+    def test_all_builtin_apple_names_are_grouped_without_mouse(self):
+        names = sorted(m.BUILTIN_APPLE)
+        groups = m.group_devices([{'name': n} for n in names + ['usb-mouse', 'bcm5974-mouse']])
+        self.assertEqual(set(groups), {'apple'})
+        self.assertEqual(groups['apple']['names'], names)
+
+    def test_lone_legacy_builtin_rekeys_without_changing_settings_or_undo(self):
+        for name in sorted(m.LEGACY_APPLE):
+            state = self.legacy_apple_state(name)
+            before = copy.deepcopy(state)
+            migrated = m.migrate(state)
+            self.assertNotIn(name, migrated['devices'])
+            expected = dict(state['devices'][name], id='apple', label='Apple')
+            self.assertEqual(migrated['devices']['apple'], expected)
+            self.assertEqual(m.lua_for(migrated['devices']), m.lua_for(state['devices']))
+            self.assertEqual(m.migrate(migrated), migrated)
+            self.assertEqual(state, before)
+            with patch.object(m, 'hypr'):
+                changed = m.change(migrated, name, 'scroll_factor', 0.1)
+            self.assertEqual(changed['devices']['apple']['settings']['scroll_factor'], 0.1)
+            self.assertEqual(changed['devices']['dell'], migrated['devices']['dell'])
+
+    def test_apple_collision_preserves_both_preferences_and_refresh_ownership(self):
+        for name in sorted(m.LEGACY_APPLE):
+            for configured, legacy_configured in product((False, True), repeat=2):
+                state = self.legacy_apple_state(name, with_apple=True)
+                state['devices'][name]['configured'] = legacy_configured
+                state['devices']['apple']['configured'] = configured
+                state['devices']['apple']['settings']['scroll_factor'] = 0.7
+                before_rules = m.lua_for(state['devices'])
+                m.save(state)
+                for names in ([name, 'apple-mtp-multi-touch'], [], [name]):
+                    view, run = self.run_main(names, 'state')
+                    saved = json.loads(m.STATE.read_text())
+                    self.assertEqual(set(saved['devices']), set(state['devices']))
+                    for key in state['devices']:
+                        self.assertEqual(saved['devices'][key]['settings'], state['devices'][key]['settings'])
+                        self.assertEqual(saved['devices'][key].get('previous_pointer_feel'),
+                                         state['devices'][key].get('previous_pointer_feel'))
+                    self.assertEqual(m.lua_for(saved['devices']), before_rules)
+                    raw = next(row for row in view['devices'] if row['id'] == name)
+                    self.assertEqual(raw['label'], 'Apple (' + name + ')')
+                    self.assertEqual(raw['connected'], name in names)
+                    self.assertFalse(any(call.args[0] == 'eval' for call in run.call_args_list))
+                with patch.object(m, 'hypr') as run:
+                    changed = m.change(saved, name, 'sensitivity', -0.2)
+                self.assertEqual(changed['devices']['apple'], saved['devices']['apple'])
+                self.assertNotIn('magic-trackpad', run.call_args.args[1])
+
+    def test_configured_group_new_interface_applies_before_rules_are_marked_current(self):
+        state = m.migrate(self.state)
+        m.save(state)
+        name = 'apple-spi-trackpad'
+        _, run = self.run_main([name], 'state')
+        self.assertTrue(any(call.args[0] == 'eval' and name in call.args[1]
+                            for call in run.call_args_list))
+        _, run = self.run_main([name], 'state')
+        self.assertFalse(any(call.args[0] == 'eval' for call in run.call_args_list))
+
+    def test_new_interface_refresh_failure_retries_from_authoritative_json(self):
+        for fail_target in ('eval', 'generated'):
+            state = m.migrate(self.state)
+            m.save(state)
+            original = m.atomic_write
+            def write(path, content):
+                if path == m.GENERATED and fail_target == 'generated':
+                    raise OSError('rules unavailable')
+                return original(path, content)
+            def compositor(*args):
+                if args[0] == 'devices':
+                    return '{"mice": [{"name": "apple-spi-trackpad"}]}'
+                if fail_target == 'eval':
+                    raise RuntimeError('compositor unavailable')
+                return 'ok'
+            with patch.object(m, 'hypr', side_effect=compositor), \
+                    patch.object(m, 'atomic_write', side_effect=write), \
+                    patch.object(m.sys, 'argv', ['trackpads.py', 'state']):
+                with self.assertRaises((OSError, RuntimeError)):
+                    m.main()
+            self.assertEqual(m.GENERATED.read_text(), m.lua_for(state['devices']))
+            self.assertIn('apple-spi-trackpad', json.loads(m.STATE.read_text())['devices']['apple']['names'])
+            _, run = self.run_main(['apple-spi-trackpad'], 'state')
+            self.assertTrue(any(call.args[0] == 'eval' for call in run.call_args_list))
+            self.assertEqual(m.GENERATED.read_text(), m.lua_for(json.loads(m.STATE.read_text())['devices']))
+
+    def test_new_interface_refresh_leaves_unrelated_groups_out_of_live_apply(self):
+        m.save(m.migrate(self.state))
+        _, run = self.run_main(['apple-spi-trackpad'], 'state')
+        applied = [call.args[1] for call in run.call_args_list if call.args[0] == 'eval']
+        self.assertEqual(len(applied), 1)
+        self.assertNotIn('ven_06cb', applied[0])
+        self.assertIn('apple-spi-trackpad', applied[0])
+
+    def test_legacy_rekey_main_accepts_stale_edit_and_preserves_other_groups(self):
+        for name in sorted(m.LEGACY_APPLE):
+            state = self.legacy_apple_state(name)
+            m.save(state)
+            view, run = self.run_main([name], 'set', name, 'scroll_factor', '0.15')
+            rows = {row['id']: row for row in view['devices']}
+            self.assertEqual(rows['apple']['settings']['scroll_factor'], 0.15)
+            self.assertTrue(rows['apple']['connected'])
+            self.assertEqual(rows['dell']['settings'], state['devices']['dell']['settings'])
+            self.assertEqual(sum(call.args[0] == 'eval' for call in run.call_args_list), 1)
+
+    def test_two_legacy_builtin_groups_keep_independent_owners_without_apple(self):
+        state = self.legacy_apple_state('bcm5974')
+        spi = self.legacy_apple_state('apple-spi-trackpad')['devices']['apple-spi-trackpad']
+        spi['settings']['scroll_factor'] = 0.1
+        state['devices']['apple-spi-trackpad'] = spi
+        m.save(state)
+        view, _ = self.run_main(['bcm5974', 'apple-spi-trackpad'], 'state')
+        rows = {row['id']: row for row in view['devices']}
+        self.assertEqual(set(rows), set(state['devices']))
+        self.assertEqual(rows['bcm5974']['settings']['scroll_factor'], 0.34)
+        self.assertEqual(rows['apple-spi-trackpad']['settings']['scroll_factor'], 0.1)
+        self.assertTrue(rows['bcm5974']['connected'])
+        self.assertTrue(rows['apple-spi-trackpad']['connected'])
+
+    def test_interface_limit_rejects_refresh_without_writing_or_applying(self):
+        state = m.migrate(self.state)
+        # A Magic Trackpad is its own group in this fork, so fill the Apple group
+        # with built-in T2 interfaces; the new SPI pad joins it and trips the limit.
+        state['devices']['apple']['names'] = [m.T2_TRACKPAD + '-' + str(i) for i in range(32)]
+        m.save(state)
+        before = (m.STATE.read_bytes(), m.GENERATED.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'Invalid trackpad names'):
+            self.run_main(['apple-spi-trackpad'], 'state')
+        self.assertEqual((m.STATE.read_bytes(), m.GENERATED.read_bytes()), before)
+
+    def test_legacy_curve_refresh_succeeds_first_time(self):
+        for generated in (None, '-- rules from an older version\n'):
+            state = copy.deepcopy(self.state)
+            state['devices']['apple']['settings'].update(
+                accel_profile='custom', curve={'precision': 0.4, 'transition': 0.9, 'fast': 1.6})
+            m.STATE.write_text(json.dumps(state))
+            if generated is None:
+                m.GENERATED.unlink(missing_ok=True)
+            else:
+                m.GENERATED.write_text(generated)
+            _, run = self.run_main(['bcm5974'], 'state')
+            migrated = m.migrate(state)
+            self.assertEqual(json.loads(m.STATE.read_text()), migrated)
+            self.assertEqual(m.GENERATED.read_text(), m.lua_for(migrated['devices']))
+            self.assertEqual(sum(call.args[0] == 'eval' for call in run.call_args_list), 1)
+            _, run = self.run_main(['bcm5974'], 'state')
+            self.assertFalse(any(call.args[0] == 'eval' for call in run.call_args_list))
+
+    def test_damaged_rules_and_new_interface_reapply_all_groups_once(self):
+        m.save(m.migrate(self.state))
+        m.GENERATED.write_text('-- damaged rules\n')
+        _, run = self.run_main(['apple-spi-trackpad'], 'state')
+        applied = [call.args[1] for call in run.call_args_list if call.args[0] == 'eval']
+        self.assertEqual(len(applied), 1)
+        self.assertIn('apple-spi-trackpad', applied[0])
+        self.assertIn('ven_06cb', applied[0])
+        self.assertEqual(m.GENERATED.read_text(), m.lua_for(json.loads(m.STATE.read_text())['devices']))
+        _, run = self.run_main(['apple-spi-trackpad'], 'state')
+        self.assertFalse(any(call.args[0] == 'eval' for call in run.call_args_list))
+
+    def test_refresh_json_write_failure_leaves_rules_and_runtime_untouched(self):
+        m.save(m.migrate(self.state))
+        before = (m.STATE.read_bytes(), m.GENERATED.read_bytes())
+        write = m.atomic_write
+        def fail_json(path, content):
+            if path == m.STATE:
+                raise OSError('state unavailable')
+            return write(path, content)
+        with patch.object(m, 'atomic_write', side_effect=fail_json), \
+                patch.object(m, 'hypr', return_value='{"mice":[{"name":"apple-spi-trackpad"}]}') as run, \
+                patch.object(m.sys, 'argv', ['trackpads.py', 'state']):
+            with self.assertRaisesRegex(OSError, 'state unavailable'):
+                m.main()
+        self.assertEqual((m.STATE.read_bytes(), m.GENERATED.read_bytes()), before)
+        self.assertFalse(any(call.args[0] == 'eval' for call in run.call_args_list))
+        _, run = self.run_main(['apple-spi-trackpad'], 'state')
+        self.assertTrue(any(call.args[0] == 'eval' for call in run.call_args_list))
+        self.assertIn('apple-spi-trackpad', json.loads(m.STATE.read_text())['devices']['apple']['names'])
+
+    def test_legacy_sensitivity_import_accepts_ps2_slash(self):
+        name = 'synps/2-synaptics-touchpad'
+        legacy = 'hl.device({ name = "' + name + '", sensitivity = -0.4 })'
+        with patch.object(m, 'defaults', return_value=self.groups['dell']['settings']), \
+                patch.object(m, 'read_state_file', return_value=legacy):
+            state = m.initialize(m.group_devices([{'name': name}]))
+        self.assertEqual(state['devices'][name]['settings']['sensitivity'], -0.4)
+        self.assertFalse(state['devices'][name]['configured'])
 
     def test_state_files_reject_links_special_files_and_large_input(self):
         target = m.STATE.parent / 'target'
@@ -246,9 +461,24 @@ class TrackpadTests(unittest.TestCase):
         self.assertEqual(only_magic['devices']['magic-trackpad']['names'], ['apple-inc.-magic-trackpad'])
 
     def test_lenovo_synaptics_without_touchpad_suffix_excludes_trackpoint(self):
-        name = 'synaptics-tm3512-010'
+        # TM3512-010 and TM3381-002 (ThinkPad X280) are one Synaptics family.
+        # The suffixed name proves the match is anchored to the whole name.
+        names = ['synaptics-tm3512-010', 'synaptics-tm3381-002', 'synaptics-tm2768-001']
+        others = ['tpps/2-elan-trackpoint', 'usb-mouse', 'synaptics-usb-mouse',
+                  'synaptics-tm3381-002-trackpoint']
+        groups = m.group_devices([{'name': n} for n in names + others])
+        self.assertEqual(set(groups), set(names))
+        for name in names:
+            self.assertEqual(groups[name]['names'], [name])
+
+    def test_ps2_synaptics_touchpad_slash_in_name_is_accepted(self):
+        # ThinkPads (e.g. the T470) report the classic PS/2 Synaptics driver as
+        # "synps/2-synaptics-touchpad" -- a literal '/' in the Hyprland device
+        # name. It must be both detected and pass name validation.
+        name = 'synps/2-synaptics-touchpad'
+        self.assertEqual(m.validate_name(name), name)
         groups = m.group_devices([{'name': n} for n in [
-            name, 'tpps/2-elan-trackpoint', 'usb-mouse', 'synaptics-usb-mouse']])
+            name, 'tpps/2-ibm-trackpoint', 'usb-mouse']])
         self.assertEqual(set(groups), {name})
         self.assertEqual(groups[name]['names'], [name])
 

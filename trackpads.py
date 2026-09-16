@@ -24,6 +24,9 @@ BOOLS = {'enabled', 'natural_scroll', 'tap_to_click', 'disable_while_typing', 'c
 RANGES = {'sensitivity': (-1, 1), 'scroll_factor': (0.001, 10), 'scroll_scale': (0.1, 10)}
 DEFAULT_CURVE = {'precision': 0.3, 'start': 0.8, 'end': 2.8, 'fast': 1.6}
 MAX_STATE_BYTES = 1024 * 1024
+BUILTIN_APPLE = {'apple-mtp-multi-touch', 'apple-spi-trackpad', 'apple-spi-touchpad',
+                 'bcm5974', 'apple-inc.-apple-internal-keyboard-/-trackpad-1'}
+LEGACY_APPLE = BUILTIN_APPLE - {'apple-mtp-multi-touch'}
 CURVE_RANGES = {'precision': (0.01, 10), 'start': (0, 3.8), 'end': (0.2, 4), 'fast': (0.01, 10)}
 
 
@@ -125,10 +128,10 @@ def validate_native_curve(curve):
 
 
 def validate_name(name):
-    # '/' is real: Hyprland keeps it, and a T2 MacBook's pad is
-    # "apple-inc.-apple-internal-keyboard-/-trackpad". Names reach Lua only
-    # through json.dumps, so it quotes like any other character.
-    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.:+/-]{1,128}', name):
+    # '/' is real: Hyprland keeps it. PS/2 Synaptics pads are "synps/2-synaptics-touchpad"
+    # and a T2 MacBook's pad is "apple-inc.-apple-internal-keyboard-/-trackpad". Names
+    # reach Lua only through json.dumps, so it quotes like any other character.
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.:/+-]{1,128}', name):
         raise ValueError('Unsupported trackpad device name')
     return name
 
@@ -154,12 +157,11 @@ def validate_setting(key, value):
     return value
 
 
-# Touchpads whose names say neither touchpad nor trackpad: Apple silicon under
-# Asahi, Intel MacBooks (the kernel's bcm5974 driver), and a Lenovo Synaptics.
-UNNAMED_TOUCHPADS = ('apple-mtp-multi-touch', 'bcm5974', 'synaptics-tm3512-010')
-# A MacBook's own pad, on Asahi, Intel and T2 Macs. A Magic Trackpad is other
-# hardware, a different size, and keeps its own settings.
-APPLE_BUILTIN = ('apple-mtp-multi-touch', 'bcm5974', 'apple-inc.-apple-internal-keyboard-/-trackpad')
+# A MacBook's own pad, on Asahi, Intel and T2 Macs, is BUILTIN_APPLE above; a
+# T2 pad may carry a numeric suffix. A Magic Trackpad is other hardware, a
+# different size, and keeps its own settings (Trackpad Pulse's split, state
+# version 5); upstream Trackpad Plus groups it with the built-in pad.
+T2_TRACKPAD = 'apple-inc.-apple-internal-keyboard-/-trackpad'
 MAGIC_TRACKPAD = 'apple-inc.-magic-trackpad'
 
 
@@ -167,10 +169,15 @@ def group_devices(mice):
     groups = {}
     for mouse in mice:
         name = mouse['name']
-        if name not in UNNAMED_TOUCHPADS and not re.search('touchpad|trackpad', name, re.I):
+        is_builtin_apple = name in BUILTIN_APPLE or name.startswith(T2_TRACKPAD)
+        # Lenovo Synaptics touchpads report a part number instead of a device
+        # type, e.g. 'synaptics-tm3381-002' on the X280 or 'synaptics-tm3512-010'
+        # elsewhere. Matching the whole name keeps a suffixed TrackPoint name out.
+        is_known_touchpad = is_builtin_apple or re.fullmatch(r'synaptics-tm[0-9]{4}-[0-9]{3}', name) is not None
+        if not is_known_touchpad and not re.search('touchpad|trackpad', name, re.I):
             continue
         validate_name(name)
-        if name.startswith(APPLE_BUILTIN):
+        if is_builtin_apple:
             key, label = 'apple', 'Apple'
         elif name.startswith(MAGIC_TRACKPAD):
             key, label = 'magic-trackpad', 'Magic Trackpad'
@@ -392,24 +399,39 @@ def restore_previous(state, key, persist=True):
     clear_pending()
 
 
-def save(state):
+def validate_persisted(state):
     validate_state(state)
     for group in state['devices'].values():
         if group['settings'].get('accel_profile') == 'custom':
             validate_native_curve(group['settings'].get('curve', DEFAULT_CURVE))
+
+
+def save(state):
+    validate_persisted(state)
     atomic_write(GENERATED, lua_for(state['devices']))
     atomic_write(STATE, json.dumps(state, indent=2) + '\n')
 
 
-def reconcile_generated(state):
+def reconcile_generated(state, previous=None):
     """Recover a removed rule file or an interrupted two-file save from JSON."""
     expected = lua_for(state['devices'])
-    if read_state_file(GENERATED) == expected:
+    stored = read_state_file(GENERATED)
+    if stored == expected:
         return
     for group in state['devices'].values():
         if group['settings'].get('accel_profile') == 'custom':
             validate_native_curve(group['settings'].get('curve', DEFAULT_CURVE))
-    hypr('eval', expected)
+    groups = state['devices']
+    if previous is not None:
+        # Old curve formats cannot be rendered by the current Lua serializer.
+        previous = migrate(previous)
+    if previous is not None and stored == lua_for(previous['devices']):
+        # Normal discovery updates only the affected groups. After interruption,
+        # the rule file no longer matches previous JSON, so reapply all saved rules.
+        groups = {key: group for key, group in groups.items()
+                  if key not in previous['devices']
+                  or lua_for({key: group}) != lua_for({key: previous['devices'][key]})}
+    hypr('eval', lua_for(groups))
     atomic_write(GENERATED, expected)
 
 
@@ -433,7 +455,7 @@ def initialize(live):
     # Import the old panel's Dell-only pointer setting without executing its Lua.
     legacy = STATE_ROOT / 'omarchy/toggles/hypr/touchpad-settings.lua'
     text = read_state_file(legacy) or ''
-    overrides = dict(re.findall(r'hl\.device\(\{ name = "([A-Za-z0-9_.:+-]+)", sensitivity = (-?[0-9.]+) \}\)', text))
+    overrides = dict(re.findall(r'hl\.device\(\{ name = "([A-Za-z0-9_.:/+-]+)", sensitivity = (-?[0-9.]+) \}\)', text))
     for group in devices.values():
         group['configured'] = False
         group['settings'] = dict(base)
@@ -441,6 +463,24 @@ def initialize(live):
             if name in overrides:
                 group['settings']['sensitivity'] = validate_setting('sensitivity', float(overrides[name]))
     return {'version': 1, 'devices': devices}
+
+
+def saved_device_owners(live, state):
+    """Route known interfaces to their saved group before grouping new devices.
+
+    Older SPI/Intel workarounds may coexist with separately configured Apple
+    devices. Their preferences and undo history must remain independent.
+    """
+    owners = {name: key for key, group in state['devices'].items() for name in group['names']}
+    routed = {}
+    for key, group in live.items():
+        for name in group['names']:
+            owner = owners.get(name, key)
+            identity = state['devices'].get(owner, group)
+            row = routed.setdefault(owner, {'id': owner, 'label': identity['label'], 'names': []})
+            if name not in row['names']:
+                row['names'].append(name)
+    return routed
 
 
 def snapshot(state, live):
@@ -479,6 +519,19 @@ def migrate(state):
                                                'end': 2 * old['transition'], 'fast': old['fast']})
             if previous['profile'] == 'mac':
                 previous['profile'] = 'custom'
+    validate_state(dict(updated, version=4))
+    devices = updated['devices']
+    legacy = [key for key in LEGACY_APPLE if key in devices
+              and devices[key]['names'] == [key]]
+    if 'apple' not in devices and len(legacy) == 1:
+        key = legacy[0]
+        # Preserve dictionary order, and therefore byte-identical generated rules.
+        updated['devices'] = {('apple' if old == key else old):
+                              (dict(group, id='apple', label='Apple') if old == key else group)
+                              for old, group in devices.items()}
+    else:
+        for key in legacy:
+            devices[key]['label'] = 'Apple (' + key + ')'
     # Version 5: a Magic Trackpad shared the built-in Apple pad's group. Each
     # now keeps a copy of the settings the group had, so nothing feels
     # different until one of them is changed.
@@ -499,6 +552,10 @@ def migrate(state):
 
 def change(state, key, option, value):
     validate_state(state)
+    if key not in state['devices'] and key in LEGACY_APPLE:
+        # A queued UI edit can still carry the pre-migration ID.
+        key = next((owner for owner, group in state['devices'].items()
+                    if key in group['names']), key)
     if key not in state['devices']:
         raise ValueError('Unknown trackpad')
     updated = copy.deepcopy(state)
@@ -526,11 +583,8 @@ def change(state, key, option, value):
             old_scale = settings.get('scroll_scale', max(1, settings['scroll_factor']))
             settings['scroll_factor'] = round(settings['scroll_factor'] * value / old_scale, 6)
         settings[option] = value
-    validate_state(updated)
     # Validate every persisted curve before touching the compositor or disk.
-    for group in updated['devices'].values():
-        if group['settings'].get('accel_profile') == 'custom':
-            validate_native_curve(group['settings'].get('curve', DEFAULT_CURVE))
+    validate_persisted(updated)
     atomic_write(STATE.with_suffix('.pending.json'), json.dumps({'state': state, 'device': key}))
     saving = False
     try:
@@ -571,12 +625,10 @@ def main():
             save(state)
         else:
             raise ValueError('Trackpads have not been initialized')
-        upgraded = migrate(state)
-        if upgraded != state:
-            save(upgraded)
-            state = upgraded
-        # Keep saved settings while discovering trackpads attached after first run.
         previous = copy.deepcopy(state)
+        state = migrate(state)
+        live = saved_device_owners(live, state)
+        # Keep saved settings while discovering trackpads attached after first run.
         new_devices = {key: group for key, group in live.items() if key not in state['devices']}
         if new_devices:
             state['devices'].update(initialize(new_devices)['devices'])
@@ -585,10 +637,13 @@ def main():
             if key in state['devices']:
                 state['devices'][key]['names'] = sorted(set(state['devices'][key]['names'] + group['names']))
         if state != previous:
-            save(state)
+            validate_persisted(state)
+            # JSON is authoritative. Keep the previous rule file until live
+            # reconciliation succeeds, so a failed/interrupted refresh retries.
+            atomic_write(STATE, json.dumps(state, indent=2) + '\n')
+        reconcile_generated(state, previous)
         if command == 'set':
             state = change(state, sys.argv[2], sys.argv[3], value)
-        reconcile_generated(state)
         print(json.dumps(snapshot(state, live)))
 
 

@@ -2,6 +2,12 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.9.0 — 2026-09-15
+
+- **Upstream device work merged.** Trackpad Plus's backend fixes from 2026.09.15.1 are in: every built-in Apple interface is recognised (`apple-spi-trackpad`, `apple-spi-touchpad`, Intel `bcm5974`, T2 with or without a suffix), a pad an older version saved under its raw name is re-keyed into the Apple group without losing a setting or a Restore previous entry, and a collision leaves the older group separate instead of overwriting it. Synaptics touchpads are matched by their `TM` part number, so the ThinkPad X280's `synaptics-tm3381-002` is found alongside `synaptics-tm3512-010`, and a suffixed TrackPoint name still cannot match.
+- Refresh is safer: JSON is authoritative, the rule file is kept until live reconciliation succeeds, an interrupted save reapplies every saved rule, and a normal discovery applies only the groups that changed.
+- Our Magic Trackpad group (state version 5) and the per-pad optimizer are unchanged; the generated Lua still says it is managed by Trackpad Pulse. Upstream's gesture editor and Overview companion were not taken.
+
 ## 1.8.1 — 2026-09-15
 
 - The Optimize card's intro no longer says "Nothing changes until you Apply" while Auto is on.

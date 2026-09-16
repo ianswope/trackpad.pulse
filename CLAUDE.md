@@ -29,6 +29,21 @@ The clone keeps `upstream` fetch-only with its push URL set to `DISABLED`; keep
 it that way, and pass `-R nixfred/trackpad.pulse` to `gh release`, because `gh`
 resolves a fork's default repo to the parent.
 
+## Syncing from upstream
+
+`upstream` is fetch-only with its push URL `DISABLED`. Take his **backend**
+work only: `trackpads.py` and its tests. His gesture editor (`gestures.py`,
+`GestureEditor.qml`) and the Overview companion are a different product; we
+have our own gestures and do not carry them. The recipe that worked for
+2026.09.15.1: `git checkout upstream/main -- trackpads.py test_trackpads.py`,
+then `git apply -3` our own delta over it, and resolve by keeping **ours** for
+the Magic Trackpad split (state version 5), the `synaptics-tm` part-number
+match and the `nixfred.trackpad-pulse` Lua header, and **theirs** for the
+Apple name set, the legacy re-key and the reconciliation hardening. His
+backend tests assume a Magic Trackpad joins the Apple group, so the ones that
+add a new interface need a name that lands in the group under test here
+(`apple-spi-trackpad`, `T2_TRACKPAD`), not a Magic Trackpad.
+
 ## Architecture in one breath
 
 The recorder (`trackpad-pulse.service`, user scope, Python 3 stdlib only) opens
