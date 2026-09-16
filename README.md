@@ -68,7 +68,7 @@ Everything else on this page is David Fano's editor as he built it: System, Mac-
 ### Optimize for my hand
 
 <div align="center">
-<img src="assets/screenshots/optimize.png" width="900" alt="Pointer feel with the Optimize for my hand card still judging the last applied change, the next change seen and waiting its turn, and the overshoot and re-stroke evidence">
+<img src="assets/screenshots/optimize.png" width="900" alt="Pointer feel with the Optimize for my hand card, its button and the Auto switch, beside the finger-speed histogram under the curve">
 </div>
 
 A wrong curve leaves fingerprints, and the recorder reads them. A long move answered at once by a short move back the other way is an **overshoot correction**: the cursor went too far at that speed. A long move continued at once in the same direction is a **re-stroke**: the pad ran out before the cursor arrived. Two-finger scrolls have the same two tells.

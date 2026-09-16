@@ -2,6 +2,10 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.8.1 — 2026-09-15
+
+- The Optimize card's intro no longer says "Nothing changes until you Apply" while Auto is on.
+
 ## 1.8.0 — 2026-09-15
 
 - **Auto mode**, opt-in, off by default. With the switch on the Optimize card set to On, the standing check applies its own single change every ten minutes when the proposal has medium or high confidence: the bigger miss of Start or End, one gain nudge, a scroll nudge, or the undo of a pass that did not help. It goes through Trackpad Plus's journalled `pointer_feel` and `scroll_factor` writes, so Restore previous still works, and it is logged exactly like a pressed Apply, so the next pass keeps it or undoes it the same way. A first fit from System or Flat is never applied on its own. Every auto change lands on the Overview as a banner with what changed and why, **Undo** and **OK**, and a desktop notification. Undo puts it back through the same path and holds that change until as many moves ask for it again.

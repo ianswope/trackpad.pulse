@@ -1737,7 +1737,7 @@ Panel {
                 Label {
                   visible: !root.proposal
                   width: parent.width; wrapMode: Text.WordWrap; font.pixelSize: 11
-                  text: "One change a pass: Start and End to where your fingers live, then the gains and the scroll speed by at most 10% from your overshoots and re-strokes. The next pass keeps the change or proposes undoing it, with the reason logged. Nothing changes until you Apply."
+                  text: "One change a pass: Start and End to where your fingers live, then the gains and the scroll speed by at most 10% from your overshoots and re-strokes. The next pass keeps the change or proposes undoing it, with the reason logged. " + (root.autoOptimizeOn ? "Auto is on: it applies that change itself and announces it on the Overview." : "Nothing changes until you Apply.")
                 }
                 Column {
                   visible: !!root.proposal
