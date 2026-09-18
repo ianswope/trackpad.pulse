@@ -421,6 +421,9 @@ Panel {
   readonly property var feelHist: Pulse.padHist(snap, root.selectedDevice, Pulse.total(todayHist) >= 30 || !week.hist ? todayHist : week.hist)
   readonly property var chart: histories[String(range)] || ({ points: [], seconds: range, now: now, bucket: 60, count: 0, peak: 0, busiest: 0, touches: 0, distance: 0 })
   readonly property var spans: snap.windows || ({})
+  // All time is the `days` table, which is never pruned, plus today. It only ever grows.
+  readonly property var allTime: spans.all || ({})
+  readonly property int allDays: Pulse.num(allTime.days)
   readonly property var pads: snap.pads || []
   readonly property real presetScale: Pulse.presetScale(snap, root.selectedDevice)
   readonly property var readablePads: pads.filter(function(p) { return p.readable })
@@ -863,6 +866,7 @@ Panel {
         lines.push("Today: " + Pulse.readout(root.snap, root.live, 0) + " touches · " + Pulse.readout(root.snap, root.live, 2) + " taps · " + Pulse.int(root.todayCounts.clicks) + " clicks · " + Pulse.readout(root.snap, root.live, 1))
         lines.push("Peak " + Pulse.readout(root.snap, root.live, 3) + " · active " + Pulse.readout(root.snap, root.live, 6) + " · " + Pulse.readout(root.snap, root.live, 7) + " palms rejected · " + Pulse.int(root.todayCounts.strays) + " stray touches")
         if (root.spans.all) lines.push("Travelled " + Pulse.distance((root.spans.week || {}).distance) + " this week · " + Pulse.distance(root.spans.all.distance) + " all time")
+        if (root.allDays > 0) lines.push(Pulse.int(root.allTime.clicks) + " clicks all time · " + Pulse.int(root.allTime.touches) + " touches over " + root.allDays + (root.allDays === 1 ? " day" : " days"))
       }
       if (root.hintActive) lines.push("Optimize has a new proposal: " + root.hint.summary)
       if (root.autoActive) lines.push("Auto optimize applied: " + root.autoNote.summary)
@@ -1335,18 +1339,22 @@ Panel {
 
           Row {
             width: parent.width; spacing: 10
-            Stat { width: (parent.width - 30) / 4; height: 96; label: root.cursorOnly ? "CURSOR TRAVEL" : "DISTANCE TODAY"
+            Stat { width: (parent.width - 40) / 5; height: 96; label: root.cursorOnly ? "CURSOR TRAVEL" : "DISTANCE TODAY"
               value: root.stale ? "—" : root.cursorOnly ? Pulse.int((root.today.cursor || {}).distance) + " px" : Pulse.distance(root.todayCounts.distance)
-              hint: root.cursorOnly ? "in logical pixels" : Pulse.distance(root.todayCounts.scroll) + " under two fingers  ·  " + Pulse.distance(root.week.distance) + " this week" }
-            Stat { width: (parent.width - 30) / 4; height: 96; label: "TAPS · CLICKS"
+              hint: root.cursorOnly ? "in logical pixels" : Pulse.distance(root.todayCounts.scroll) + " scrolled  ·  " + Pulse.distance(root.week.distance) + " this week" }
+            Stat { width: (parent.width - 40) / 5; height: 96; label: "TAPS · CLICKS"
               value: root.stale || root.cursorOnly ? "—" : Pulse.int(Pulse.num(root.todayCounts.taps) + Pulse.num(root.todayCounts.taps2) + Pulse.num(root.todayCounts.taps3)) + " · " + Pulse.int(Pulse.num(root.todayCounts.clicks) + Pulse.num(root.todayCounts.rightClicks))
               hint: Pulse.int(root.todayCounts.taps2) + " two-finger taps  ·  " + Pulse.int(root.todayCounts.rightClicks) + " right clicks" }
-            Stat { width: (parent.width - 30) / 4; height: 96; label: "PEAK SPEED"
+            Stat { width: (parent.width - 40) / 5; height: 96; label: "PEAK SPEED"
               value: root.stale ? "—" : root.cursorOnly ? Pulse.pxSpeed((root.today.cursor || {}).peak) : Pulse.speed(root.today.peak)
               hint: (root.today.peakAt ? "at " + Pulse.clock(root.today.peakAt) : "no movement yet") + "  ·  median " + (root.cursorOnly ? Pulse.pxSpeed(Pulse.percentile(root.todayHist, root.binWidth * 10, 0.5)) : Pulse.speed(Pulse.percentile(root.todayHist, root.binWidth, 0.5))) }
-            Stat { width: (parent.width - 30) / 4; height: 96; label: "ACTIVE TIME"
+            Stat { width: (parent.width - 40) / 5; height: 96; label: "ACTIVE TIME"
               value: root.stale ? "—" : Pulse.duration(root.cursorOnly ? (root.today.cursor || {}).active : root.todayCounts.active)
               hint: root.cursorOnly ? "cursor in motion" : Pulse.duration(root.todayCounts.moving) + " moving  ·  " + Pulse.duration(root.week.active) + " this week" }
+            // The odometer: every click this pad has ever reported, and it never resets.
+            Stat { width: (parent.width - 40) / 5; height: 96; label: "CLICKS ALL TIME"
+              value: root.stale || root.cursorOnly ? "—" : Pulse.int(root.allTime.clicks)
+              hint: root.allDays > 0 ? Pulse.int(Pulse.num(root.allTime.clicks) / root.allDays) + " a day  ·  " + (root.spans.firstDay ? "since " + root.spans.firstDay : root.allDays + " days") : "counting from today" }
           }
 
           Row {
@@ -1370,7 +1378,7 @@ Panel {
                   Label { text: "━ peak mm/s"; color: root.heat; font.pixelSize: 10 }
                   Label { text: Pulse.int(root.chart.touches) + " touches  ·  " + Pulse.distance(root.chart.distance) + "  ·  " + (root.chart.count || 0) + " minutes recorded"; font.pixelSize: 10 }
                 }
-                Label { font.pixelSize: 10; text: (root.chart.count || 0) < 2 ? "History is starting. One row per minute, seven-day retention." : "Recording while closed  ·  7-day retention  ·  hover to inspect" }
+                Label { font.pixelSize: 10; text: (root.chart.count || 0) < 2 ? "History is starting. One row per minute for a week; the daily totals are kept forever." : "Recording while closed  ·  minutes for 7 days, daily totals forever  ·  hover to inspect" }
               }
             }
             Card {
@@ -2358,7 +2366,7 @@ Panel {
             width: parent.width; spacing: 10
             Stat { width: (parent.width - 30) / 4; height: 91; label: "VERSION"; value: root.releaseVersion !== "" ? "v" + root.releaseVersion : "—"; hint: "manifest.json, the single source" }
             Stat { width: (parent.width - 30) / 4; height: 91; label: "RECORDER"; value: root.stale ? "offline" : Pulse.accessLabel(root.snap); hint: "trackpad-pulse.service, user scope"; valueColor: root.stale ? Color.urgent : root.ink }
-            Stat { width: (parent.width - 30) / 4; height: 91; label: "RETENTION"; value: "7 days"; hint: "one row per minute, this machine only" }
+            Stat { width: (parent.width - 30) / 4; height: 91; label: "RETENTION"; value: "7 days · forever"; hint: "minutes for a week, daily totals kept forever" }
             Stat { width: (parent.width - 30) / 4; height: 91; label: "LEAVES THE BOX"; value: "nothing"; hint: "no network calls, no telemetry upstream" }
           }
           Column {

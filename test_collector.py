@@ -898,6 +898,26 @@ class DataFeatureTests(unittest.TestCase):
             self.assertEqual(w['all']['days'], 5)
             self.assertEqual(w['firstDay'], tp.day_key(now - 40 * 86400))
 
+    def test_all_time_clicks_outlive_the_retention_prune(self):
+        """The odometer is forever: `record` prunes minutes and sessions, never days."""
+        with tempfile.TemporaryDirectory() as directory:
+            tp.STATE = Path(directory)
+            db = tp.db_open()
+            now = 1_700_000_000.0
+            for back in (900, 400, 30, 3):
+                past = tp.Recorder._fresh_today(None, now - back * 86400)
+                past['counts']['clicks'] = 100; past['counts']['rightClicks'] = 7
+                tp.record_day(db, past)
+            today = tp.Recorder._fresh_today(None, now)
+            today['counts']['clicks'] = 5; today['counts']['rightClicks'] = 1
+            tp.record_day(db, today)
+            tp.record(db, now, dict(tp.zero_counters(), clicks=5), [0.0] * (tp.BINS + 1), 'evdev')
+            w = tp.windows(db, today, now, None)
+            self.assertEqual(w['all']['clicks'], 4 * 107 + 6, 'every day ever, right clicks included')
+            self.assertEqual(w['all']['days'], 5)
+            self.assertGreater(w['all']['clicks'], w['year']['clicks'], 'the 900-day-old day is only in all time')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM minutes').fetchone()[0], 1, 'minutes were pruned, days were not')
+
 
 class GestureTests(unittest.TestCase):
     def test_pair_actions_own_their_axis_and_unknowns_are_refused(self):

@@ -2,6 +2,10 @@
 
 Versions follow semver and live in `manifest.json`, which the panel header, the About page and `status` all read. Every release is tagged `vX.Y.Z`.
 
+## 1.9.1 — 2026-09-18
+
+- **Clicks all time, on the Overview.** A fifth card beside Distance, Taps, Peak and Active carries the lifetime click count with its per-day average and the date recording started. It counts left and right buttons, it comes from the `days` table, which nothing prunes, and it never resets: the seven-day retention only ever touched minutes, pad minutes and sessions. The bar tooltip carries the same line, and the About page's Retention card now says "7 days · forever" rather than implying the daily totals go too.
+
 ## 1.9.0 — 2026-09-15
 
 - **Upstream device work merged.** Trackpad Plus's backend fixes from 2026.09.15.1 are in: every built-in Apple interface is recognised (`apple-spi-trackpad`, `apple-spi-touchpad`, Intel `bcm5974`, T2 with or without a suffix), a pad an older version saved under its raw name is re-keyed into the Apple group without losing a setting or a Restore previous entry, and a collision leaves the older group separate instead of overwriting it. Synaptics touchpads are matched by their `TM` part number, so the ThinkPad X280's `synaptics-tm3381-002` is found alongside `synaptics-tm3512-010`, and a suffixed TrackPoint name still cannot match.
