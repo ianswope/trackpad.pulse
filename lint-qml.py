@@ -8,7 +8,9 @@ import subprocess
 import tempfile
 
 repo = Path(__file__).resolve().parent
-lint = shutil.which('qmllint') or '/usr/lib/qt6/bin/qmllint'
+# Qt 6's binary first: on a host that also has qt5-declarative, /usr/bin/qmllint
+# is Qt 5's and rejects --json.
+lint = next((p for p in ('/usr/lib/qt6/bin/qmllint', shutil.which('qmllint')) if p and Path(p).is_file()), 'qmllint')
 with tempfile.TemporaryDirectory(prefix='trackpad-plus-lint-') as directory:
     (Path(directory) / 'qs').symlink_to('/usr/share/omarchy/shell', target_is_directory=True)
     result = subprocess.run([lint, '-I', directory, '--json', '-',

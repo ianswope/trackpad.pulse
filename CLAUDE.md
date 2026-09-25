@@ -120,6 +120,8 @@ python3 test_ipc.py            # the real IpcHandler block in an offscreen shell
 python3 lint-qml.py            # every warning fails except the listed host-metadata gaps
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Basic \
   /usr/lib/qt6/bin/qmltestrunner -input tst_curve.qml
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Basic \
+  /usr/lib/qt6/bin/qmltestrunner -input tst_chip.qml   # the chip fades a lift with the animation off
 ```
 
 New QML must lint clean with no exceptions. `Pulse.js` must stay loadable by

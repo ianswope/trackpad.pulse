@@ -35,6 +35,8 @@ python3 test_ipc.py            # the panel's own IpcHandler in an offscreen shel
 python3 lint-qml.py            # qmllint over every QML file
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Basic \
   /usr/lib/qt6/bin/qmltestrunner -input tst_curve.qml
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Basic \
+  /usr/lib/qt6/bin/qmltestrunner -input tst_chip.qml   # the chip fades a lift with the animation off
 perl -c touchpad-state
 bash -n touchpad-sensitivity
 git diff --check
